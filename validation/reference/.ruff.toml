@@ -1,0 +1,8 @@
+# Vendored third-party code -- see PROVENANCE.md. These files are copied verbatim from
+# Friends-of-Tracking-Data-FoTD/LaurieOnTracking at commit 7ed3ff85 and must stay byte-identical to
+# upstream so their sha256 hashes verify, so linting them is noise: any fix would be a diff we are
+# not allowed to make. Our own compatibility changes live in modern_pandas.patch instead.
+line-length = 200
+
+[lint]
+select = []
