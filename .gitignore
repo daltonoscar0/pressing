@@ -1,0 +1,23 @@
+# caches and virtualenvs
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# build artifacts
+dist/
+build/
+*.egg-info/
+
+# downloaded data (never committed; re-fetch via the loaders)
+data/raw/
+
+# generated output
+out/
+
+# generated reports at the repo root only; bundled/demo and docs PDFs are tracked
+/*.pdf
+!data/demo/**/*.pdf
+!docs/**/*.pdf
