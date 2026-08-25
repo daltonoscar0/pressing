@@ -1,0 +1,606 @@
+"""Tests for the Metrica loaders in :mod:`pressing._io`.
+
+Every test runs offline against the truncated real CSVs under
+``tests/fixtures/metrica`` or against tiny Metrica-shaped files written to
+``tmp_path``. Nothing here reaches the network or the full 120 MB cache.
+"""
+
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from pressing import _io
+from pressing.schema import TRACKING_COLUMNS, validate_tracking
+
+FIXTURES = Path(__file__).parent / "fixtures" / "metrica"
+
+#: Frame at which game 1's home team substitutes Player1 for Player12. The two
+#: players overlap on exactly this frame, which is why it is worth a test.
+SUBSTITUTION_FRAME = 46706
+
+
+@pytest.fixture(scope="module")
+def tracking_g1() -> pd.DataFrame:
+    """Canonical tracking for the game 1 fixture slice."""
+    return _io.load_metrica_tracking(1, FIXTURES)
+
+
+@pytest.fixture(scope="module")
+def tracking_g2() -> pd.DataFrame:
+    """Canonical tracking for the game 2 fixture slice."""
+    return _io.load_metrica_tracking(2, FIXTURES)
+
+
+def _raw_tracking_rows(game: int, side: str) -> tuple[list[list[str]], list[list[str]]]:
+    """Return ``(header_rows, data_rows)`` straight out of a fixture CSV."""
+    path = FIXTURES / f"Sample_Game_{game}" / f"Sample_Game_{game}_RawTrackingData_{side}_Team.csv"
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    return rows[:3], rows[3:]
+
+
+# --------------------------------------------------------------------------- #
+# The sportio shim
+# --------------------------------------------------------------------------- #
+
+
+def test_backend_name_matches_shim_flag() -> None:
+    assert _io.backend_name() == ("sportio" if _io.HAVE_SPORTIO else "internal")
+
+
+def test_unknown_source_still_raises() -> None:
+    if _io.HAVE_SPORTIO:  # pragma: no cover - only when the shared layer exists
+        pytest.skip("sportio is installed, so the internal fallback is not exercised")
+    with pytest.raises(NotImplementedError):
+        _io.load_tracking("skillcorner", match=1)
+
+
+# --------------------------------------------------------------------------- #
+# The three-header-row parse
+# --------------------------------------------------------------------------- #
+
+
+def test_tracking_has_three_header_rows_not_two() -> None:
+    header, data = _raw_tracking_rows(1, "Home")
+    assert header[0][3] == "Home", "row 0 repeats the team name over each x/y pair"
+    assert header[1][3] == "11", "row 1 carries jersey numbers"
+    assert header[2][:3] == ["Period", "Frame", "Time [s]"], "row 2 carries the real names"
+    assert data[0][0] == "1" and data[0][1] == "1", "data starts on the fourth line"
+
+
+def test_column_names_walk_the_third_row() -> None:
+    header, _ = _raw_tracking_rows(1, "Home")
+    names = _io._tracking_column_names(header[2])
+
+    assert names[:3] == ["Period", "Frame", "Time [s]"]
+    assert names[3:5] == ["Player11_x", "Player11_y"], "named cell -> _x, following blank -> _y"
+    assert names[-2:] == ["Ball_x", "Ball_y"], "the ball is the last named column"
+    assert len(names) == len(header[2]), "one derived name per physical column"
+
+
+def test_column_names_reject_a_leading_blank() -> None:
+    with pytest.raises(ValueError, match="unpaired blank column"):
+        _io._tracking_column_names(["Period", "Frame", "Time [s]", "", "Player1"])
+
+
+def test_ball_row_present_and_teams_are_canonical(tracking_g1: pd.DataFrame) -> None:
+    assert set(tracking_g1["team"].unique()) == {"home", "away", "ball"}
+    ball = tracking_g1[tracking_g1["team"] == "ball"]
+    assert not ball.empty
+    assert ball["player_id"].isna().all()
+    assert list(tracking_g1.columns) == list(TRACKING_COLUMNS)
+
+
+def test_one_row_per_frame_entity(tracking_g1: pd.DataFrame) -> None:
+    keys = tracking_g1[["frame", "team", "player_id"]].astype(str)
+    assert not keys.duplicated().any()
+
+
+def test_the_ball_is_only_taken_from_one_file(tracking_g1: pd.DataFrame) -> None:
+    per_frame = tracking_g1[tracking_g1["team"] == "ball"].groupby("frame").size()
+    assert per_frame.max() == 1, "the ball columns are identical in both team files"
+
+
+# --------------------------------------------------------------------------- #
+# The "Player 26" space bug
+# --------------------------------------------------------------------------- #
+
+
+def test_game2_away_header_really_contains_a_space() -> None:
+    header, _ = _raw_tracking_rows(2, "Away")
+    assert "Player 26" in header[2], "the fixture must still carry the raw quirk"
+
+
+def test_player_label_spaces_are_stripped_in_the_tracking_header() -> None:
+    header, _ = _raw_tracking_rows(2, "Away")
+    names = _io._tracking_column_names(header[2])
+    assert "Player26_x" in names and "Player26_y" in names
+    assert not any(" " in name for name in names[3:])
+
+
+def test_player_label_spaces_are_stripped_in_events(tmp_path: Path) -> None:
+    events = _write_events_csv(
+        tmp_path,
+        [
+            ("Away", "PASS", "", 1, 10, 20, "Player 26", "Player25", 0.5, 0.5, 0.6, 0.4),
+            ("Away", "BALL LOST", "INTERCEPTION", 1, 30, 40, "Player25", "", 0.6, 0.4, 0.7, 0.3),
+        ],
+    )
+    assert events["player_id"].tolist() == ["Player26", "Player25"]
+    assert _io.event_extra(events, "to_player").tolist() == ["Player25", None]
+
+
+def test_tracking_and_event_players_join_after_stripping(tmp_path: Path) -> None:
+    """The whole point of stripping: game 2 otherwise silently loses a player."""
+    tracking = _write_tracking_csv(
+        tmp_path,
+        home_players=[("1", "Player1"), ("11", "Player11")],
+        away_players=[("25", "Player25"), ("26", "Player 26")],
+        n_frames=10,
+    )
+    events = _write_events_csv(
+        tmp_path,
+        [("Away", "PASS", "", 1, 1, 5, "Player 26", "Player25", 0.5, 0.5, 0.6, 0.4)],
+    )
+    tracked = set(tracking["player_id"].dropna())
+    named = set(events["player_id"].dropna()) | set(
+        _io.event_extra(events, "to_player").dropna()
+    )
+    assert named <= tracked
+    assert "Player26" in tracked
+
+
+# --------------------------------------------------------------------------- #
+# Coordinates
+# --------------------------------------------------------------------------- #
+
+
+def test_top_left_origin_y_is_flipped(tracking_g1: pd.DataFrame) -> None:
+    """Metrica y grows downward from a top-left origin; canonical y grows up."""
+    header, data = _raw_tracking_rows(1, "Home")
+    names = _io._tracking_column_names(header[2])
+    x_col, y_col = names.index("Player11_x"), names.index("Player11_y")
+    raw_x, raw_y = float(data[0][x_col]), float(data[0][y_col])
+
+    row = tracking_g1[(tracking_g1["frame"] == 1) & (tracking_g1["player_id"] == "Player11")]
+    assert len(row) == 1
+    # Game 1 mirrors period 2, so period 1 is the untouched conversion.
+    assert row["period"].item() == 1
+    assert row["x"].item() == pytest.approx(raw_x * 105.0)
+    assert row["y"].item() == pytest.approx((1.0 - raw_y) * 68.0)
+    # A raw y above the halfway line must land below it once flipped, and vice versa.
+    assert (raw_y - 0.5) * (row["y"].item() - 34.0) < 0
+
+
+def test_coordinates_stay_on_the_canonical_pitch(tracking_g1: pd.DataFrame) -> None:
+    # Players and the ball do go slightly behind the goal line, hence the margin.
+    assert tracking_g1["x"].between(-8.0, 113.0).all()
+    assert tracking_g1["y"].between(-8.0, 76.0).all()
+
+
+def test_playing_direction_is_not_hardcoded(
+    tracking_g1: pd.DataFrame, tracking_g2: pd.DataFrame
+) -> None:
+    """The two sample games genuinely disagree about which way home attacks."""
+    assert tracking_g1.attrs["raw_direction"]["home"] == {1: 1, 2: -1}
+    assert tracking_g2.attrs["raw_direction"]["home"] == {1: -1, 2: 1}
+    assert tracking_g1.attrs["flip_period"] == 2
+    assert tracking_g2.attrs["flip_period"] == 1
+
+
+@pytest.mark.parametrize("game", [1, 2])
+def test_single_playing_direction_after_rotation(game: int) -> None:
+    tracking = _io.load_metrica_tracking(game, FIXTURES, with_velocities=False)
+    assert tracking.attrs["attack_direction"] == {"home": 1, "away": -1}
+
+    keepers = tracking.attrs["goalkeeper"]
+    for team, own_half_is_low in (("home", True), ("away", False)):
+        block = tracking[
+            (tracking["team"] == team) & (tracking["player_id"] == keepers[team])
+        ]
+        by_period = block.groupby("period")["x"].mean()
+        assert len(by_period) == 2, "both periods must be present in the slice"
+        for value in by_period:
+            if own_half_is_low:
+                assert value < 52.5, f"{team} keeper drifted into the wrong half: {value}"
+            else:
+                assert value > 52.5, f"{team} keeper drifted into the wrong half: {value}"
+
+
+def test_rotation_is_a_180_degree_turn(tracking_g2: pd.DataFrame) -> None:
+    """Game 2 mirrors period 1, so period-1 rows must be x -> 105-x, y -> 68-y."""
+    header, data = _raw_tracking_rows(2, "Home")
+    names = _io._tracking_column_names(header[2])
+    x_col, y_col = names.index("Player11_x"), names.index("Player11_y")
+    raw_x, raw_y = float(data[0][x_col]), float(data[0][y_col])
+
+    row = tracking_g2[(tracking_g2["frame"] == 1) & (tracking_g2["player_id"] == "Player11")]
+    assert row["period"].item() == 1
+    assert row["x"].item() == pytest.approx(105.0 - raw_x * 105.0)
+    assert row["y"].item() == pytest.approx(68.0 - (1.0 - raw_y) * 68.0)
+
+
+def test_detect_playing_direction_rejects_same_side_teams() -> None:
+    frame = _synthetic_long(home_gk_x=10.0, away_gk_x=12.0)
+    with pytest.raises(ValueError, match="attacking the same way"):
+        _io.detect_playing_direction(frame)
+
+
+def test_detect_playing_direction_rejects_a_missing_half_time_flip() -> None:
+    frame = _synthetic_long(home_gk_x=10.0, away_gk_x=95.0, flip_second_half=False)
+    with pytest.raises(ValueError, match="did not flip playing direction"):
+        _io.detect_playing_direction(frame)
+
+
+# --------------------------------------------------------------------------- #
+# Velocities
+# --------------------------------------------------------------------------- #
+
+
+def test_velocity_is_a_backward_difference_when_unsmoothed(tracking_g1: pd.DataFrame) -> None:
+    raw = _io.compute_velocities(tracking_g1, smoothing=False)
+    player = raw[(raw["team"] == "home") & (raw["player_id"] == "Player11")]
+    player = player[player["frame"].between(2, 120)].sort_values("frame")
+    expected = player["x"].diff() / player["t"].diff()
+    assert np.allclose(player["vx"].to_numpy()[1:], expected.to_numpy()[1:])
+
+
+def test_velocity_is_nan_at_a_substitution_boundary(tracking_g1: pd.DataFrame) -> None:
+    """Player12 comes on at the frame Player1 goes off; both overlap there."""
+    on_pitch = tracking_g1[tracking_g1["frame"] == SUBSTITUTION_FRAME]["player_id"]
+    assert {"Player1", "Player12"} <= set(on_pitch)
+
+    incoming = tracking_g1[
+        (tracking_g1["player_id"] == "Player12") & (tracking_g1["frame"] == SUBSTITUTION_FRAME)
+    ]
+    assert incoming["vx"].isna().all(), "an arriving player has no previous frame to difference"
+
+    outgoing = tracking_g1[
+        (tracking_g1["player_id"] == "Player1") & (tracking_g1["frame"] == SUBSTITUTION_FRAME)
+    ]
+    assert np.isfinite(outgoing["vx"].item()), "the departing player is still being tracked"
+
+
+def test_velocity_never_crosses_a_frame_gap(tracking_g1: pd.DataFrame) -> None:
+    """The fixture stitches three frame blocks together; no velocity may span them."""
+    block_starts = {46647, 71269}
+    first = tracking_g1[tracking_g1["frame"].isin(block_starts)]
+    assert not first.empty
+    assert first["vx"].isna().all()
+    assert first["vy"].isna().all()
+
+
+def test_velocity_never_crosses_the_period_boundary(tracking_g1: pd.DataFrame) -> None:
+    period2_start = int(tracking_g1.loc[tracking_g1["period"] == 2, "frame"].min())
+    edge = tracking_g1[tracking_g1["frame"] == period2_start]
+    assert edge["vx"].isna().all()
+
+
+def test_velocity_respects_the_max_speed_clip() -> None:
+    frame = _synthetic_long(home_gk_x=10.0, away_gk_x=95.0)
+    teleport = (frame["player_id"] == "home_gk") & (frame["frame"] == 5)
+    frame.loc[teleport, "x"] = 60.0
+    out = _io.compute_velocities(frame, maxspeed=12.0, smoothing=False)
+    keeper = out[out["player_id"] == "home_gk"]
+    assert keeper.loc[keeper["frame"] == 5, "vx"].isna().all()
+    assert np.isfinite(keeper.loc[keeper["frame"] == 4, "vx"].item())
+
+
+def test_smoothing_survives_nan_which_the_reference_cannot() -> None:
+    """scipy's default mode raises on NaN; the per-run wrapper must not."""
+    frame = _synthetic_long(home_gk_x=10.0, away_gk_x=95.0, n_frames=40)
+    frame = frame[~((frame["player_id"] == "home_gk") & (frame["frame"].between(10, 14)))]
+    out = _io.compute_velocities(frame)
+    keeper = out[out["player_id"] == "home_gk"].sort_values("frame")
+    assert np.isfinite(keeper.loc[keeper["frame"] < 10, "vx"].to_numpy()[1:]).all()
+    assert keeper.loc[keeper["frame"] == 15, "vx"].isna().all(), "no diff across the gap"
+    tail = keeper[keeper["frame"].between(16, 40)]
+    assert np.isfinite(tail["vx"].to_numpy()).all()
+    assert keeper.loc[keeper["frame"] == 41, "vx"].isna().all(), "no diff across half time"
+
+
+# --------------------------------------------------------------------------- #
+# Reference frame
+# --------------------------------------------------------------------------- #
+
+
+def test_reference_frame_known_corners() -> None:
+    frame = pd.DataFrame({"x": [0.0, 105.0, 52.5], "y": [0.0, 68.0, 34.0]})
+    out = _io.to_reference_frame(frame)
+    assert out["x"].tolist() == pytest.approx([-53.0, 53.0, 0.0])
+    assert out["y"].tolist() == pytest.approx([-34.0, 34.0, 0.0])
+
+
+def test_reference_frame_scales_velocity_but_does_not_shift_it() -> None:
+    frame = pd.DataFrame({"x": [52.5], "y": [34.0], "vx": [1.0], "vy": [1.0]})
+    out = _io.to_reference_frame(frame)
+    assert out["vx"].item() == pytest.approx(106.0 / 105.0)
+    assert out["vy"].item() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("flip", [False, True])
+def test_reference_frame_round_trip(tracking_g1: pd.DataFrame, flip: bool) -> None:
+    original = tracking_g1.head(2000)
+    there = _io.to_reference_frame(original, flip=flip)
+    back = _io.from_reference_frame(there, flip=flip)
+    for column in ("x", "y", "vx", "vy"):
+        assert np.allclose(
+            original[column].to_numpy(), back[column].to_numpy(), equal_nan=True, atol=1e-9
+        )
+
+
+def test_reference_frame_flip_is_a_rotation() -> None:
+    frame = pd.DataFrame({"x": [0.0], "y": [0.0]})
+    plain = _io.to_reference_frame(frame)
+    flipped = _io.to_reference_frame(frame, flip=True)
+    assert flipped["x"].item() == pytest.approx(-plain["x"].item())
+    assert flipped["y"].item() == pytest.approx(-plain["y"].item())
+
+
+# --------------------------------------------------------------------------- #
+# Events
+# --------------------------------------------------------------------------- #
+
+
+def test_events_share_the_tracking_frame_clock() -> None:
+    events = _io.load_metrica_events(1, FIXTURES, flip_period=None)
+    starts = events["t"].to_numpy() * _io.METRICA_FPS
+    assert np.allclose(starts, np.rint(starts), atol=1e-6)
+    frames = _io.event_extra(events, "start_frame").to_numpy(dtype=float)
+    assert np.allclose(starts, frames)
+
+
+def test_subtype_is_parsed_as_a_token_set() -> None:
+    assert _io.subtype_tokens("HEAD-ON TARGET-GOAL") == {"HEAD", "ON TARGET", "GOAL"}
+    assert _io.subtype_tokens("GOAL KICK-INTERCEPTION") == {"GOAL KICK", "INTERCEPTION"}
+    assert _io.subtype_tokens("FORCED-END HALF") == {"FORCED", "END HALF"}
+    assert _io.subtype_tokens(np.nan) == frozenset()
+    assert _io.subtype_tokens("") == frozenset()
+
+
+def test_events_are_rotated_with_the_tracking(tmp_path: Path) -> None:
+    rows = [("Home", "PASS", "", 1, 10, 20, "Player1", "Player2", 0.0, 0.0, 1.0, 1.0)]
+    plain = _write_events_csv(tmp_path, rows, flip_period=None)
+    flipped = _write_events_csv(tmp_path, rows, flip_period=1)
+    assert plain["x"].item() == pytest.approx(0.0)
+    assert plain["y"].item() == pytest.approx(68.0)
+    assert flipped["x"].item() == pytest.approx(105.0)
+    assert flipped["y"].item() == pytest.approx(0.0)
+    assert flipped["end_x"].item() == pytest.approx(0.0)
+    assert flipped["end_y"].item() == pytest.approx(68.0)
+
+
+def test_load_metrica_match_shares_one_rotation() -> None:
+    match = _io.load_metrica_match(2, FIXTURES)
+    assert match.match_id == "metrica_2"
+    assert match.events.attrs["flip_period"] == match.tracking.attrs["flip_period"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Parquet demo asset
+# --------------------------------------------------------------------------- #
+
+
+def test_parquet_round_trip_is_accurate_to_half_a_centimetre(
+    tracking_g1: pd.DataFrame, tmp_path: Path
+) -> None:
+    path = _io.write_tracking_parquet(tracking_g1, tmp_path / "g1.parquet")
+    back = _io.read_tracking_parquet(path)
+
+    left = tracking_g1.sort_values(["frame", "team", "player_id"], ignore_index=True)
+    right = back.sort_values(["frame", "team", "player_id"], ignore_index=True)
+    assert len(left) == len(right)
+
+    for column in ("x", "y"):
+        error = np.abs(left[column].to_numpy() - right[column].to_numpy())
+        assert np.nanmax(error) <= 0.005 + 1e-9, "int16 centimetres cost at most 0.5 cm"
+        assert (left[column].isna() == right[column].isna()).all()
+
+    assert (left["frame"] == right["frame"]).all()
+    assert np.allclose(left["t"], right["t"])
+    assert (left["team"] == right["team"]).all()
+    assert (
+        left["player_id"].fillna("-").to_numpy() == right["player_id"].fillna("-").to_numpy()
+    ).all()
+    assert (left["jersey"].fillna(-1) == right["jersey"].fillna(-1)).all()
+
+
+def test_parquet_restores_the_match_metadata(
+    tracking_g1: pd.DataFrame, tmp_path: Path
+) -> None:
+    path = _io.write_tracking_parquet(tracking_g1, tmp_path / "g1.parquet")
+    back = _io.read_tracking_parquet(path, recompute_velocities=False)
+    assert back.attrs["match_id"] == "metrica_1"
+    assert back.attrs["attack_direction"] == {"home": 1, "away": -1}
+    assert back.attrs["flip_period"] == 2
+    assert back.attrs["raw_direction"]["home"] == {1: 1, 2: -1}, "int keys survive JSON"
+    assert back["vx"].isna().all()
+    validate_tracking(back)
+
+
+def test_parquet_uses_zstd_and_a_dictionary_only_on_team(
+    tracking_g1: pd.DataFrame, tmp_path: Path
+) -> None:
+    """pyarrow's default dictionary encoding makes this data substantially larger."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = _io.write_tracking_parquet(tracking_g1, tmp_path / "g1.parquet")
+    group = pq.ParquetFile(path).metadata.row_group(0)
+    encodings = {}
+    for index in range(group.num_columns):
+        column = group.column(index)
+        encodings[column.path_in_schema] = set(column.encodings)
+        assert column.compression == "ZSTD"
+    assert "RLE_DICTIONARY" in encodings["team"]
+    assert "RLE_DICTIONARY" not in encodings["x_cm"]
+
+
+def test_parquet_can_keep_velocities(tracking_g1: pd.DataFrame, tmp_path: Path) -> None:
+    path = _io.write_tracking_parquet(
+        tracking_g1, tmp_path / "with_v.parquet", include_velocities=True
+    )
+    back = _io.read_tracking_parquet(path)
+    left = tracking_g1.sort_values(["frame", "team", "player_id"], ignore_index=True)
+    right = back.sort_values(["frame", "team", "player_id"], ignore_index=True)
+    for column in ("vx", "vy"):
+        error = np.abs(left[column].to_numpy() - right[column].to_numpy())
+        assert np.nanmax(error) <= 0.005 + 1e-9
+
+
+def test_quantisation_rejects_out_of_range_values() -> None:
+    with pytest.raises(ValueError, match="int16 centimetre range"):
+        _io._quantise(pd.Series([1e6]))
+
+
+# --------------------------------------------------------------------------- #
+# Path resolution
+# --------------------------------------------------------------------------- #
+
+
+def test_metrica_path_accepts_the_flat_layout(tmp_path: Path) -> None:
+    flat = tmp_path / "Sample_Game_1__Sample_Game_1_RawEventsData.csv"
+    flat.write_text("Team\n", encoding="utf-8")
+    assert _io._metrica_path(tmp_path, 1, "events") == flat
+
+
+def test_metrica_path_reports_every_candidate(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="Sample_Game_7"):
+        _io._metrica_path(tmp_path, 7, "home")
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _write_events_csv(
+    tmp_path: Path,
+    rows: list[tuple],
+    *,
+    game: int = 9,
+    flip_period: int | None = None,
+) -> pd.DataFrame:
+    """Write a Metrica-shaped events CSV and load it back canonically.
+
+    Args:
+        tmp_path: Directory to write into.
+        rows: ``(team, type, subtype, period, start_frame, end_frame, from, to,
+            start_x, start_y, end_x, end_y)`` tuples in normalized coordinates.
+        game: Game number to embed in the filename.
+        flip_period: Passed straight to :func:`_io.load_metrica_events`.
+
+    Returns:
+        The canonical events frame.
+    """
+    path = tmp_path / f"Sample_Game_{game}_RawEventsData.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "Team", "Type", "Subtype", "Period", "Start Frame", "Start Time [s]",
+                "End Frame", "End Time [s]", "From", "To",
+                "Start X", "Start Y", "End X", "End Y",
+            ]
+        )
+        for team, kind, subtype, period, start, end, sender, receiver, sx, sy, ex, ey in rows:
+            writer.writerow(
+                [
+                    team, kind, subtype, period,
+                    start, start / _io.METRICA_FPS, end, end / _io.METRICA_FPS,
+                    sender, receiver, sx, sy, ex, ey,
+                ]
+            )
+    return _io.load_metrica_events(game, tmp_path, flip_period=flip_period)
+
+
+def _write_tracking_csv(
+    tmp_path: Path,
+    *,
+    home_players: list[tuple[str, str]],
+    away_players: list[tuple[str, str]],
+    n_frames: int,
+    game: int = 9,
+) -> pd.DataFrame:
+    """Write a pair of Metrica-shaped tracking CSVs and load them back.
+
+    Positions are laid out so the home goalkeeper (the first home player) sits
+    near ``x = 0`` and the away goalkeeper near ``x = 1``, which is what the
+    direction detector keys off.
+
+    Args:
+        tmp_path: Directory to write into.
+        home_players: ``(jersey, label)`` pairs; the first is the goalkeeper.
+        away_players: Same for the away team.
+        n_frames: Number of period-1 frames followed by the same many period-2
+            frames, so the half-time flip check has something to look at.
+        game: Game number to embed in the filenames.
+
+    Returns:
+        The canonical tracking frame.
+    """
+    for side, players in (("Home", home_players), ("Away", away_players)):
+        path = tmp_path / f"Sample_Game_{game}_RawTrackingData_{side}_Team.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["", "", ""] + [c for _ in players for c in (side, "")] + ["", ""])
+            writer.writerow(["", "", ""] + [c for j, _ in players for c in (j, "")] + ["", ""])
+            writer.writerow(
+                ["Period", "Frame", "Time [s]"]
+                + [c for _, label in players for c in (label, "")]
+                + ["Ball", ""]
+            )
+            for index in range(2 * n_frames):
+                period = 1 if index < n_frames else 2
+                mirror = period == 2
+                row = [period, index + 1, round((index + 1) / _io.METRICA_FPS, 2)]
+                for slot, _ in enumerate(players):
+                    base = 0.05 if side == "Home" else 0.95
+                    x = base + slot * 0.05
+                    x = 1.0 - x if mirror else x
+                    row += [round(x, 4), round(0.4 + slot * 0.01, 4)]
+                row += [0.5, 0.5]
+                writer.writerow(row)
+    return _io.load_metrica_tracking(game, tmp_path)
+
+
+def _synthetic_long(
+    *,
+    home_gk_x: float,
+    away_gk_x: float,
+    n_frames: int = 20,
+    flip_second_half: bool = True,
+) -> pd.DataFrame:
+    """Build a minimal canonical long tracking frame directly, in metres."""
+    rows = []
+    for period in (1, 2):
+        sign = -1.0 if (period == 2 and flip_second_half) else 1.0
+        for offset in range(n_frames):
+            frame = (period - 1) * n_frames + offset + 1
+            for team, gk_x in (("home", home_gk_x), ("away", away_gk_x)):
+                x = 52.5 + sign * (gk_x - 52.5)
+                rows.append(
+                    {
+                        "match_id": "synthetic",
+                        "t": frame / _io.METRICA_FPS,
+                        "period": period,
+                        "frame": frame,
+                        "team": team,
+                        "player_id": f"{team}_gk",
+                        "jersey": 1,
+                        "x": x + 0.01 * offset,
+                        "y": 34.0,
+                        "vx": np.nan,
+                        "vy": np.nan,
+                        "confidence": 1.0,
+                    }
+                )
+    frame_out = pd.DataFrame(rows)
+    frame_out["period"] = frame_out["period"].astype("int8")
+    frame_out["frame"] = frame_out["frame"].astype("int32")
+    frame_out["jersey"] = frame_out["jersey"].astype("Int16")
+    frame_out["confidence"] = frame_out["confidence"].astype("float32")
+    return frame_out
