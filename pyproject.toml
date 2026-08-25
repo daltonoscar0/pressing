@@ -16,6 +16,7 @@ dependencies = [
     "pandas",
     "numpy",
     "scipy",
+    "pyarrow",
     "matplotlib",
     "scikit-learn",
     "pydantic>=2",
