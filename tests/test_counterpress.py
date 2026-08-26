@@ -9,18 +9,29 @@ neutral value.
 
 from __future__ import annotations
 
+import os
+import sys
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 
+import pressing
 from pressing.counterpress import (
+    _MIN_PARALLEL_LOSSES,
     BALL_POLICIES,
     DEFAULT_TIMEPOINTS,
     DEFAULT_WEIGHTING,
     LOSS_SCORE_COLUMNS,
+    MAX_USEFUL_JOBS,
+    WEIGHTING_LABELS,
     CounterPressParams,
     _ball_at,
     _build_index,
+    alternate_weighting,
+    default_jobs,
+    headline_weighting,
     minutes_played,
     per_phase,
     per_player,
@@ -828,3 +839,193 @@ def test_denser_timepoints_are_available() -> None:
     params = CounterPressParams(timepoints=(0.0, 0.5, 1.0, 1.5, 2.0))
     scored = _score(tracking, losses, params)
     assert scored["n_timepoints"].iloc[0] == 5
+
+
+# --------------------------------------------------------------------------- #
+# The weighting contract
+# --------------------------------------------------------------------------- #
+
+
+def test_the_headline_and_the_alternate_are_never_the_same_column() -> None:
+    """The bug this guards: two identical columns under two headings.
+
+    ``mean_recovery`` is the headline weighting and ``mean_recovery_alt`` is the
+    other one, so under the shipped ``"area"`` default the alternate must be the
+    EPV share -- a different number -- rather than a second copy of the area
+    share printed beside it.
+    """
+    tracking, scored = _two_team_scene()
+    assert headline_weighting(scored) == DEFAULT_WEIGHTING
+
+    for table in (per_team(scored), per_phase(scored)):
+        assert "mean_recovery_area" not in table.columns
+        assert table.attrs["weighting"] == "area"
+        assert table.attrs["alt_weighting"] == "epv"
+        rows = table[table["scored_losses"] > 0]
+        assert len(rows) > 0
+        assert not np.allclose(rows["mean_recovery"], rows["mean_recovery_alt"])
+
+    players = per_player(scored, tracking, radius_m=200.0)
+    credited = players[players["losses_nearby"] > 0]
+    assert len(credited) > 0
+    assert not np.allclose(credited["mean_recovery"], credited["mean_recovery_alt"])
+    assert players.attrs["weighting"] == "area"
+
+
+def test_switching_the_weighting_swaps_the_two_columns() -> None:
+    """``with_weighting`` re-points the headline; the alternate follows it."""
+    _, scored = _two_team_scene()
+    area = per_team(scored).set_index("team")
+    epv = per_team(with_weighting(scored, "epv")).set_index("team")
+
+    assert epv.attrs["weighting"] == "epv"
+    assert epv.attrs["alt_weighting"] == "area"
+    assert np.allclose(epv["mean_recovery"], area["mean_recovery_alt"])
+    assert np.allclose(epv["mean_recovery_alt"], area["mean_recovery"])
+
+
+def test_the_weighting_is_readable_without_attrs() -> None:
+    """Pandas drops ``attrs`` freely, so the columns are the fallback source."""
+    _, scored = _two_team_scene()
+    stripped = scored.copy()
+    stripped.attrs.clear()
+    assert headline_weighting(stripped) == "area"
+
+    switched = with_weighting(scored, "epv").copy()
+    switched.attrs.clear()
+    assert headline_weighting(switched) == "epv"
+
+    assert alternate_weighting("area") == "epv"
+    assert alternate_weighting("epv") == "area"
+    assert set(WEIGHTING_LABELS) == {"area", "epv"}
+
+
+def test_the_summary_says_which_weighting_it_used() -> None:
+    """A headline number a coach reads must carry its own definition."""
+    _, scored = _two_team_scene()
+    assert summarise_match(scored)["weighting"] == "area"
+    assert summarise_match(with_weighting(scored, "epv"))["weighting"] == "epv"
+
+
+# --------------------------------------------------------------------------- #
+# Parallel scoring
+# --------------------------------------------------------------------------- #
+
+#: A grid coarse enough that this file can afford to score dozens of losses.
+COARSE_GRID = make_grid(n_x=10)
+
+
+def _moving_scene(n_frames: int) -> pd.DataFrame:
+    """A scene in which every frame is a different, deterministic formation.
+
+    Nobody stands still, so no two losses in it can score the same number by
+    accident -- which is what makes comparing two runs of it worth anything.
+    """
+    return build_tracking(
+        [
+            {
+                "frames": np.array([frame]),
+                "period": 1,
+                "home": _spread(11, 1000 + frame),
+                "away": _spread(11, 5000 + frame),
+                "ball": np.array([52.5, 34.0]),
+            }
+            for frame in range(1, n_frames + 1)
+        ]
+    )
+
+
+def test_one_worker_and_many_agree_exactly() -> None:
+    """``jobs`` is a wall-clock knob and nothing else.
+
+    Every numeric column must be bit-identical between the serial path and the
+    process pool, NaNs included. Scoring enough losses to cross
+    ``_MIN_PARALLEL_LOSSES`` is the point: below it the pool is skipped and the
+    comparison would be vacuous.
+    """
+    n = _MIN_PARALLEL_LOSSES
+    tracking = _moving_scene(n * 5 + 200)
+    losses = build_losses(
+        [
+            {"frame": 10 + 5 * i, "losing_team": "home" if i % 2 else "away"}
+            for i in range(n)
+        ]
+    )
+    serial = score_losses(
+        tracking, empty_events(), losses=losses, grid=COARSE_GRID, jobs=1
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parallel = score_losses(
+            tracking, empty_events(), losses=losses, grid=COARSE_GRID, jobs=2
+        )
+    # Without this the test would happily compare the serial path with itself.
+    assert not [w for w in caught if "falling back" in str(w.message)]
+
+    assert len(serial) == n
+    assert bool(serial["scored"].all())
+    # Not a scene where every loss happens to score the same thing.
+    assert serial["recovery"].nunique() == n
+
+    assert list(serial.columns) == list(parallel.columns)
+    for column in serial.columns:
+        left, right = serial[column], parallel[column]
+        if pd.api.types.is_bool_dtype(left) or not pd.api.types.is_numeric_dtype(left):
+            assert left.equals(right), column
+        else:
+            assert np.array_equal(
+                left.to_numpy(dtype=float), right.to_numpy(dtype=float), equal_nan=True
+            ), column
+
+
+def test_a_handful_of_losses_never_starts_a_pool() -> None:
+    """Spawning six processes to score two losses is a loss, so we do not."""
+    tracking = _static_scene(_spread(11, 0), _spread(11, 3), n_frames=400)
+    losses = build_losses([{"frame": 100, "losing_team": "home"}])
+    scored = score_losses(
+        tracking, empty_events(), losses=losses, grid=COARSE_GRID, jobs=MAX_USEFUL_JOBS
+    )
+    assert bool(scored["scored"].iloc[0])
+    assert scored.attrs["jobs"] == MAX_USEFUL_JOBS
+
+
+def test_default_jobs_is_capped_and_at_least_one() -> None:
+    """The cap is measured: scaling is flat past six workers on this machine."""
+    assert 1 <= default_jobs() <= MAX_USEFUL_JOBS
+
+
+def test_the_matplotlib_cache_guard_stands_aside_when_it_should(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The package sets MPLCONFIGDIR at import; here is when it must not.
+
+    This lives with the counter-press tests because the demo budget it protects
+    is this module's budget: on a fresh clone the font-cache build is the
+    single largest item in front of the first surface being computed.
+    """
+    monkeypatch.setenv("MPLCONFIGDIR", "/somewhere/the/user/chose")
+    assert pressing.use_repo_matplotlib_cache() is None
+
+    monkeypatch.delenv("MPLCONFIGDIR")
+    monkeypatch.setitem(sys.modules, "matplotlib", object())
+    assert pressing.use_repo_matplotlib_cache() is None
+    assert "MPLCONFIGDIR" not in os.environ
+    # Nothing to warm either: this process already has matplotlib loaded.
+    assert pressing.warm_matplotlib_cache() is None
+
+
+def test_the_matplotlib_cache_is_repo_local_and_gitignored() -> None:
+    """``out/`` is already in .gitignore, and the cache is regenerable."""
+    cache = pressing.matplotlib_cache_dir()
+    assert cache is not None
+    assert cache.name == ".mplcache"
+    assert cache.parent.name == "out"
+    assert (cache.parents[1] / "pyproject.toml").is_file()
+
+
+def test_jobs_must_be_a_positive_count() -> None:
+    """Zero or negative workers is a typo, not a request for the serial path."""
+    tracking = _static_scene(_spread(11, 0), _spread(11, 3))
+    losses = build_losses([{"frame": 10, "losing_team": "home"}])
+    with pytest.raises(ValueError, match="jobs must be a positive integer"):
+        score_losses(tracking, empty_events(), losses=losses, grid=GRID, jobs=0)
