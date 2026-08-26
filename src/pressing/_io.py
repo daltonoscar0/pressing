@@ -1079,8 +1079,9 @@ def _rescale(
 
 _PARQUET_META_KEY: Final[bytes] = b"pressing.tracking"
 #: Positions and velocities are stored as int16 in centimetres (and cm/s).
-#: Measured on the real files: max position error 0.500 cm, RMS 0.289 cm, and
-#: the required int16 range is only -478..11130.
+#: Measured on the real files, over all 3,278,389 game-1 tracking rows: max
+#: per-coordinate error 0.5000 cm and RMS 0.2887 cm (as a 2D distance, 0.7071 cm
+#: max and 0.4082 cm RMS), and the required int16 range is only -478..11130.
 _CM: Final[float] = 100.0
 
 
@@ -1097,13 +1098,17 @@ def write_tracking_parquet(
     ``compression="zstd"`` and ``use_dictionary=["team"]``. That last argument
     is the single largest sizing lever and it is counter-intuitive: pyarrow's
     DEFAULT dictionary encoding makes this data substantially LARGER (measured
-    on game 1 at native 25 Hz: 11.64 MB with dictionaries everywhere versus
-    7.47 MB with dictionaries on ``team`` only).
+    on game 1 at native 25 Hz: 12.11 MB with dictionaries everywhere, against
+    7.75 MB with dictionaries on ``team`` only and 7.76 MB with none at all --
+    so ``team`` is the only column a dictionary helps, and only barely).
 
     Velocities are omitted by default because they are pure smoothed derivatives
-    of the positions already in the file, and storing them roughly doubles it
-    (measured on game 1: 7.75 MB without, 13.85 MB with).
-    :func:`read_tracking_parquet` recomputes them on the way back in.
+    of the positions already in the file, and storing them nearly doubles it
+    (measured on game 1: 7,754,194 bytes without, 13,852,088 bytes with, i.e.
+    7.75 MB against 13.85 MB).
+
+    That trade is paid back on read, and it is not free: see
+    :func:`read_tracking_parquet`.
 
     Args:
         tracking: Canonical long tracking frame.
@@ -1161,6 +1166,16 @@ def read_tracking_parquet(
     recompute_velocities: bool = True,
 ) -> pd.DataFrame:
     """Read back an asset written by :func:`write_tracking_parquet`.
+
+    Cost, measured on the game-1 asset (3,278,389 rows), median of five runs:
+    the default path takes 1.79 s, of which the parquet read itself is 0.05 s
+    and assembling the canonical frame brings it to 0.20 s. The remaining ~1.6 s
+    is :func:`compute_velocities` rerunning the Savitzky-Golay smoothing that
+    ``write_tracking_parquet`` chose not to store. Reading a file written with
+    ``include_velocities=True`` instead takes 0.21 s, so the 6.1 MB saved on
+    disk costs roughly 1.6 s on every read. That is the right way round for a
+    demo asset committed to git and read once per run, and the wrong way round
+    for anything read repeatedly.
 
     Args:
         path: Path to the ``.parquet`` file.

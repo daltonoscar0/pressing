@@ -7,9 +7,12 @@ integrated forward along the ball flight to give each team's share of every
 cell on the pitch.
 
 Everything here is vectorised over ``(n_players, n_cells)``; the only Python
-loop is over the ~250 integration timesteps. That is deliberate. A per-cell
-Python loop of the identical algorithm costs 0.5 s for a single 50x32 surface,
-and a match has hundreds of possession losses.
+loop is over the ~250 integration timesteps. That is deliberate. The Friends of
+Tracking reference, which is a per-cell Python loop of the identical algorithm,
+measures 0.687-0.699 s for a single 50x32 surface on this machine against
+9.96-10.27 ms here (three runs of 40 real possession losses, shipped float32
+``renormalise`` configuration, 68-69x). A match has hundreds of possession
+losses, so that ratio is the difference between seconds and minutes.
 
 Coordinates
 -----------
@@ -60,12 +63,33 @@ __all__ = [
     "to_reference_frame",
 ]
 
-#: The forward-Euler integration below is only *conditionally* stable. Measured
-#: on this model: ``int_dt <= 0.06`` agrees with ``0.04`` at Pearson r >=
-#: 0.999998, ``0.08`` diverges to surface values of order 1e42 and ``0.10`` to
-#: 1e44 -- with no exception raised, only easily-suppressed RuntimeWarnings.
-#: Coarsening the timestep is therefore NOT a speed lever, it is a correctness
-#: cliff, and :class:`PitchControlParams` refuses to be built past it.
+#: Largest ``int_dt`` this model is validated at. The name is historical and
+#: overstates the case: measured over 60 real Metrica game-1 possession-loss
+#: frames on the default 50x32 grid at ``clamp="raw"``, this integrator does
+#: not blow up when the timestep is coarsened. Zero non-finite cells and zero
+#: warnings at every dt from 0.02 to 1.00 in *both* float32 and float64, and
+#: the worst raw ``attacking + defending`` grows exactly linearly with dt:
+#: 1.0000 at 0.02, 1.2251 at 0.04, 1.8376 at 0.06, 3.0627 at 0.10, 30.6274 at
+#: 1.00 -- each ratio to the dt=0.04 value equal to the ratio of the timesteps
+#: to four decimal places. That is one whole final Euler step of overshoot,
+#: capped by the per-cell freeze in :func:`pitch_control_full` (SUBTLETY 2),
+#: not a conditional-stability failure.
+#:
+#: What the ceiling protects is accuracy, and specifically accuracy the shipped
+#: clamp hides. Against dt=0.04 on the same frames the minimum per-event
+#: Pearson r under the default ``renormalise`` is 0.999969 at dt=0.06, 0.999762
+#: at dt=0.10 and 0.990551 at dt=1.00; the raw surfaces underneath correlate at
+#: 0.992362, 0.910386 and 0.217793 and reach cell values of 11.47.
+#: Renormalising divides the overshoot back out, so a surface integrated at
+#: dt=1.00 still returns entirely inside [0, 1] with no NaN and no warning --
+#: nothing downstream can tell. Coarsening dt is also a real speed lever
+#: (0.0300 s to 0.0036 s per surface in float64 going from dt=0.04 to dt=0.50),
+#: which is exactly why it needs a guard and not a footnote.
+#:
+#: The divergence the name implies does exist, but in a *different* loop:
+#: replacing the per-cell freeze with one global "stop when every cell has
+#: converged" break makes the same scheme reach 1.0e50 at dt=0.04 and 3.6e68 at
+#: dt=0.08 on these frames. That is what SUBTLETY 2 is guarding, not this.
 MAX_STABLE_INT_DT: float = 0.06
 
 #: The logistic argument is clipped to +/- this before ``np.exp``. Required:
@@ -179,8 +203,10 @@ class PitchControlParams:
             outright without integrating.
         time_to_control_def: Same for the defending team.
         dtype: Working floating point type. float32 is the default: measured
-            1.2-1.46x faster than float64 at Pearson r = 1.0000000 and
-            max abs difference 1.2e-06.
+            1.35x faster than float64 over 60 real possession-loss frames
+            (19.12 ms against 25.84 ms per surface), at a minimum per-event
+            Pearson r of 1.0000000000 and a max absolute difference of
+            7.19e-07.
     """
 
     max_player_speed: float = 5.0
@@ -212,16 +238,18 @@ class PitchControlParams:
         if self.int_dt <= 0.0:
             raise ValueError(f"int_dt must be positive, got {self.int_dt!r}")
         # Deliberately a ValueError and not an `assert`: `python -O` strips
-        # asserts, and the failure mode this guards is silent divergence to
-        # 1e42 that still renders as a plausible-looking heatmap.
+        # asserts, and the failure mode this guards is invisible downstream --
+        # a coarse dt still renders as a perfectly plausible heatmap.
         if self.int_dt > MAX_STABLE_INT_DT:
             raise ValueError(
-                f"int_dt={self.int_dt} exceeds the stability limit "
-                f"{MAX_STABLE_INT_DT}. The forward-Euler scheme used here is "
-                "conditionally stable: dt<=0.06 matches dt=0.04 to r>=0.999998, "
-                "dt=0.08 diverges to ~1e42 and dt=0.10 to ~1e44 with no "
-                "exception raised. int_dt is a stability boundary, not an "
-                "accuracy/speed knob -- if you need this faster, coarsen the "
+                f"int_dt={self.int_dt} exceeds {MAX_STABLE_INT_DT}, the largest "
+                "timestep this model is validated at. Despite the constant's name "
+                "this is not a stability limit: the scheme does not diverge, it "
+                "just gets less accurate in a way the default renormalise clamp "
+                "hides. A dt=1.00 surface still comes back inside [0, 1] with no "
+                "NaN and no warning while correlating at only r=0.9906 against "
+                "dt=0.04 (r=0.2178 before the clamp, raw cells reaching 11.47). "
+                "Coarsening dt does buy real speed; if you need it, coarsen the "
                 "grid or subsample time, never dt."
             )
 
@@ -535,10 +563,21 @@ class PitchControlResult:
         defending: ``(n_y, n_x)`` control probability for the other team,
             after the clamp policy has been applied.
         checksum: ``(n_y, n_x)`` of ``attacking + defending`` as the integrator
-            produced it, *before* any clamping. Values slightly above 1.0 are
-            normal -- forward Euler overshoots the convergence tolerance on the
-            final step -- and 1.05 has been observed on a real event. Values
-            far from 1 mean something is wrong.
+            produced it, *before* any clamping. Overshoot above 1 is normal,
+            because forward Euler takes its final step whole, and it is not
+            small. Do not assert that this is near 1. Measured at every
+            possession loss in both Metrica sample games on the default 50x32
+            grid, with the ball taken from tracking as the product does:
+            game 1 reaches 1.872903 (172 of 409,600 cells above 1, on 6 of 256
+            losses) and game 2 reaches 1.601270 (326 of 371,200 cells, on 13 of
+            232 losses). The validation notebook's configuration -- reference
+            grid, ball from the event row -- reaches 2.800681 over its 257
+            events, with the attacking surface alone reaching 1.005366.
+            The useful bounds are the other way round: on all 488 of those real
+            losses every cell converged, and the smallest raw sum seen was
+            exactly 0.990000, i.e. ``1 - model_converge_tol``. A value below
+            that on a cell flagged in :attr:`converged`, or any non-finite
+            value, would mean something is wrong.
         clamp: The policy that was applied.
         converged: ``(n_y, n_x)`` boolean, True where the cell reached the
             convergence tolerance rather than exhausting ``max_int_time``.
@@ -714,8 +753,13 @@ def pitch_control_full(
 
     # Working set. Cells drop out as they converge, so the arrays inside the
     # loop shrink; `idx` maps a working slot back to its cell in the full grid.
-    # Measured on a typical frame: 130 of the 250 steps run at all, and the
-    # summed active-cell count is 71.6k against 208k for a fixed-width loop.
+    # Instrumented over all 256 game-1 possession losses on the default 50x32
+    # grid (1600 cells, 250 available offsets): a median 118 steps run at all
+    # (min 76, max 233), and the summed working width -- the cells actually
+    # multiplied -- is a median 72.8k against 400k for a fixed-width loop, a
+    # 5.5x saving. The working set is wider than the strictly unconverged count
+    # (median 50.2k) because it is only halved once fewer than half its slots
+    # are still live.
     idx = np.arange(n_cells)
     w_kta = k * tti_a
     w_ktd = k * tti_d
@@ -833,9 +877,11 @@ def pitch_control(
     with row 0 at the bottom touchline.
 
     Clamp policies. Forward Euler takes one whole step past the convergence
-    tolerance, so the two teams' raw probabilities can sum to slightly more
-    than 1 -- 1.0418 has been measured on a real possession loss. Downstream
-    code must never be handed a "probability" above 1, so:
+    tolerance, so the two teams' raw probabilities can sum to well over 1: the
+    largest raw sum measured at a real possession loss is 1.872903 on this grid
+    and 2.800681 on the validation notebook's, and the attacking surface on its
+    own has been measured at 1.198193. Downstream code must never be handed a
+    "probability" above 1, so:
 
     * ``"renormalise"`` (default) divides both surfaces by their sum wherever
       that sum exceeds 1, preserving the ratio between the teams, then clips to
