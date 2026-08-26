@@ -32,6 +32,28 @@ The shipped configuration (float32, `clamp="renormalise"`) scores a pooled r of 
 event of 257 below 0.95; section 9 of the notebook shows that gap is entirely the deliberate
 probability clamp described under **Caveats**, not a modelling difference.
 
+## Re-measured for the v0.1.0 tag
+
+The comparison was re-run from scratch outside the notebook before tagging, over the same 257 events
+and the same reference grid, to confirm nothing had drifted while the rest of the package was built.
+It was run twice on the tagging day, hours apart. Nothing moved:
+
+| configuration | pooled r | mean per-event r | min per-event r | events < 0.95 | max abs difference |
+|---|---|---|---|---|---|
+| `clamp="raw"`, float64 | 1.0000000000 | 1.0000000000 | 1.0000000000 | 0 of 257 | 3.941e-15 |
+| shipped default (`clamp="renormalise"`, float32) | 0.9995631111 | 0.9991927210 | 0.9433488807 | 1 of 257 | 6.457e-01 |
+
+Same run: 411,200 cells compared per configuration, mean absolute difference 1.737e-16 and 7.183e-04
+respectively, reference maximum cell value 1.005366, raw `PA+PD` checksum range 0.990000 to 2.800681,
+y-flip guard 0.618073 and 0.618334 (both far below the aligned correlation).
+
+Timings from the second of those runs: the reference took 315.75 s for the 257 surfaces, 1228.6 ms
+each, against 20.66 ms each in the shipped float32 configuration and 27.53 ms in the reference's own
+float64 convention — **59x** and **45x**. Both halves were timed on a machine shared with unrelated
+work, so they are slower than the notebook's committed numbers and only the ratio means anything. The
+correlations, as always, did not move: they were identical to ten decimal places across both reruns
+and the notebook.
+
 Timing on the same grid and the same 257 events: reference 248.28 s (0.9661 s per surface), ours
 4.04 s (0.0157 s per surface) — **61.5x**. Wall-clock timings move with machine load; three full
 runs on the same laptop gave 59.1x, 59.3x and the 61.5x recorded in the committed outputs. The
