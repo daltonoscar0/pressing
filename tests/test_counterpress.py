@@ -18,6 +18,11 @@ import pandas as pd
 import pytest
 
 import pressing
+from pressing.baseline import (
+    MIN_LOSSES_FOR_PLAYER,
+    add_expected_recovery,
+    loss_features,
+)
 from pressing.counterpress import (
     _MIN_PARALLEL_LOSSES,
     BALL_POLICIES,
@@ -41,6 +46,7 @@ from pressing.counterpress import (
     team_comparison,
     with_weighting,
 )
+from pressing.phases import PHASES
 from pressing.pitchcontrol import make_grid
 from pressing.schema import (
     EVENT_COLUMNS,
@@ -1029,3 +1035,245 @@ def test_jobs_must_be_a_positive_count() -> None:
     losses = build_losses([{"frame": 10, "losing_team": "home"}])
     with pytest.raises(ValueError, match="jobs must be a positive integer"):
         score_losses(tracking, empty_events(), losses=losses, grid=GRID, jobs=0)
+
+
+# --------------------------------------------------------------------------- #
+# The residual, its interval and the suppression rule
+# --------------------------------------------------------------------------- #
+
+
+def _crowd_scene(counts: dict[str, int], seed: int = 21) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A scene giving each home player a chosen number of nearby losses.
+
+    Home player ``H<i>`` stands on a spot of its own, 35 m from the next, which
+    is more than twice the 15 m attribution radius: a loss on that spot is
+    credited to that player and to nobody else.
+
+    The AWAY team drifts across the pitch on a slow Lissajous path and the ball
+    tracks a sine, so no two losses are the same scene and a player's
+    recoveries genuinely vary. That matters: with everyone frozen, every loss of
+    a player would score the identical number, every bootstrap interval would
+    have width zero, and the interval tests would be vacuous rather than
+    passing.
+
+    Args:
+        counts: ``{"H0": 14, "H1": 3, ...}`` -- how many losses each player is
+            near. Keys must be ``H0``, ``H1``, ... in order.
+        seed: Seed for the away team's base positions.
+
+    Returns:
+        ``(tracking, losses)``.
+    """
+    spots = [(15.0 + 35.0 * index, 34.0) for index in range(len(counts))]
+    home = np.array(spots)
+    away_base = _spread(6, seed + 1)
+
+    def away_at(at: int) -> np.ndarray:
+        """The away team's drift, clamped well inside the pitch."""
+        shift = np.array([16.0 * np.sin(0.031 * at), 12.0 * np.cos(0.047 * at)])
+        moved = away_base + shift
+        moved[:, 0] = np.clip(moved[:, 0], 3.0, PITCH_LENGTH - 3.0)
+        moved[:, 1] = np.clip(moved[:, 1], 3.0, PITCH_WIDTH - 3.0)
+        return moved
+
+    def ball_y(at: int) -> float:
+        """A smooth ball path, well inside both touchlines."""
+        return 34.0 + 8.0 * float(np.sin(0.23 * at))
+
+    #: Every player gets the SAME 550-frame stretch of away drift, sampled at
+    #: whatever density their loss count implies. Blocking by player instead
+    #: would give a player with five losses five nearly identical scenes and a
+    #: player with sixty a much wider spread, so the interval width would track
+    #: the spread rather than the count and the test below would be measuring
+    #: the wrong thing.
+    span, gap = 550, 150
+    plan: list[tuple[int, float]] = []
+    start = 10
+    for (x, _), count in zip(spots, counts.values(), strict=True):
+        offsets = np.linspace(0.0, float(span), count) if count > 1 else np.zeros(1)
+        plan += [(start + int(round(offset)), x) for offset in offsets]
+        start += span + gap
+    horizon = start + gap
+
+    ball_x = np.full(horizon + 1, spots[0][0])
+    for loss_frame, x in plan:
+        ball_x[loss_frame : loss_frame + 140] = x
+
+    tracking = build_tracking(
+        [
+            {
+                "frames": np.array([at]),
+                "period": 1,
+                "home": home,
+                "away": away_at(at),
+                "ball": np.array([ball_x[at], ball_y(at)]),
+            }
+            for at in range(1, horizon + 1)
+        ]
+    )
+    losses = build_losses(
+        [
+            {"frame": loss_frame, "losing_team": "home", "x": x, "y": ball_y(loss_frame)}
+            for loss_frame, x in plan
+        ]
+    )
+    return tracking, losses
+
+
+def test_a_player_with_too_few_losses_is_suppressed_not_printed() -> None:
+    """Below :data:`MIN_LOSSES_FOR_PLAYER` the value is marked not-to-print.
+
+    The number itself is still computed -- suppressing is the report's job, not
+    a reason to lose the arithmetic -- but ``reportable`` says False and the
+    report is expected to honour it, exactly as season mode refuses a per-90
+    below 270 minutes.
+    """
+    counts = {"H0": MIN_LOSSES_FOR_PLAYER + 2, "H1": MIN_LOSSES_FOR_PLAYER, "H2": 2}
+    tracking, losses = _crowd_scene(counts)
+    players = per_player(_score(tracking, losses), tracking).set_index("player_id")
+    assert int(players.loc["H0", "losses_nearby"]) == MIN_LOSSES_FOR_PLAYER + 2
+    assert bool(players.loc["H0", "reportable"]) is True
+    assert bool(players.loc["H1", "reportable"]) is True
+    assert bool(players.loc["H2", "reportable"]) is False
+    assert np.isfinite(players.loc["H2", "mean_recovery"])
+
+
+def test_a_phase_column_carries_its_own_suppression_flag() -> None:
+    """Phase counts are much smaller than the pooled one, so they get their own
+    decision rather than inheriting the pooled row's."""
+    tracking, losses = _crowd_scene({"H0": MIN_LOSSES_FOR_PLAYER + 5, "H1": 3})
+    players = per_player(_score(tracking, losses), tracking).set_index("player_id")
+    for phase in PHASES:
+        count = int(players.loc["H0", f"losses_{phase}"])
+        assert bool(players.loc["H0", f"reportable_{phase}"]) is (
+            count >= MIN_LOSSES_FOR_PLAYER
+        )
+
+
+def _fabricated_recoveries(
+    losses: pd.DataFrame,
+    recovery: np.ndarray,
+) -> pd.DataFrame:
+    """A scored-loss frame whose recovery column is dictated, not measured.
+
+    The interval test below is about the width of an interval as a function of
+    the sample size, and nothing else. Scoring a real scene would let the
+    metric's own variance -- which depends on where on the pitch each player
+    stands -- decide the answer instead of the count. So the geometry stays
+    real, for the attribution, and the recovery numbers are handed in.
+
+    Args:
+        losses: Output of :func:`build_losses`.
+        recovery: One value per loss.
+
+    Returns:
+        A frame in the shape :func:`per_player` consumes.
+    """
+    out = losses.copy()
+    out["phase"] = "middle"
+    out["recovery"] = recovery
+    out["recovery_area"] = recovery
+    out["recovery_epv"] = recovery
+    out["epv_conceded"] = 0.0
+    out["regained_within_5s"] = False
+    out["time_to_regain"] = np.nan
+    out["scored"] = True
+    out.attrs["weighting"] = "area"
+    out.attrs["alt_weighting"] = "epv"
+    return out
+
+
+def test_the_player_interval_widens_as_the_loss_count_falls() -> None:
+    """Two players drawing from ONE distribution, one twelve times more often.
+
+    Sixty losses against five is a factor of 3.5 in the standard error of the
+    mean, so the direction of the inequality is not a coin flip.
+    """
+    tracking, losses = _crowd_scene({"H0": 60, "H1": 5})
+    # A five-value cycle, so H0's sixty losses are twelve whole cycles and
+    # H1's five are one. Their means and their standard deviations are then
+    # identical by construction and only the COUNT differs -- a random draw of
+    # five would have let an unlucky sample decide the answer instead.
+    pattern = np.array([0.30, 0.42, 0.50, 0.58, 0.70])
+    values = pattern[np.arange(len(losses)) % pattern.size]
+    players = per_player(
+        _fabricated_recoveries(losses, values), tracking
+    ).set_index("player_id")
+    assert players.loc["H0", "mean_recovery"] == pytest.approx(
+        players.loc["H1", "mean_recovery"]
+    )
+    wide = players.loc["H1", "recovery_hi"] - players.loc["H1", "recovery_lo"]
+    narrow = players.loc["H0", "recovery_hi"] - players.loc["H0", "recovery_lo"]
+    assert wide > 2.0 * narrow
+    for name in ("H0", "H1"):
+        assert (
+            players.loc[name, "recovery_lo"]
+            <= players.loc[name, "mean_recovery"]
+            <= players.loc[name, "recovery_hi"]
+        )
+
+
+def test_the_player_table_is_identical_between_runs() -> None:
+    """The bootstrap is seeded, because the demo PDF must be byte-stable."""
+    tracking, losses = _crowd_scene({"H0": 12, "H1": 12})
+    scored = _score(tracking, losses)
+    first = per_player(scored, tracking)
+    second = per_player(scored, tracking)
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_without_a_baseline_the_residual_columns_are_nan_but_present() -> None:
+    """The report never has to branch on which columns exist."""
+    tracking, losses = _crowd_scene({"H0": 6, "H1": 6})
+    players = per_player(_score(tracking, losses), tracking)
+    assert players.attrs["has_residual"] is False
+    for column in ("mean_expected", "mean_residual", "residual_lo", "residual_hi"):
+        assert column in players.columns
+        assert players[column].isna().all()
+    assert "reportable" in players.columns
+
+
+def test_the_residual_reaches_the_player_and_phase_tables() -> None:
+    """With a baseline attached, both aggregates report expectation and
+    residual alongside the level, and the residual is the difference."""
+    tracking, losses = _crowd_scene({"H0": 12, "H1": 12, "H2": 12})
+    scored = _score(tracking, losses)
+    features = loss_features(scored, tracking)
+    with_baseline = add_expected_recovery(scored, features)
+
+    players = per_player(with_baseline, tracking).set_index("player_id")
+    assert players.attrs["has_residual"] is True
+    assert players.attrs["min_losses_for_player"] == MIN_LOSSES_FOR_PLAYER
+    for name in ("H0", "H1", "H2"):
+        assert players.loc[name, "mean_residual"] == pytest.approx(
+            players.loc[name, "mean_recovery"] - players.loc[name, "mean_expected"]
+        )
+
+    phases = per_phase(with_baseline)
+    assert {"mean_expected", "mean_residual"} <= set(phases.columns)
+    populated = phases[phases["scored_losses"] > 0]
+    assert populated["mean_residual"].to_numpy() == pytest.approx(
+        (populated["mean_recovery"] - populated["mean_expected"]).to_numpy()
+    )
+
+
+def test_the_residual_is_zero_mean_over_the_match_it_was_fitted_on() -> None:
+    """One match means an in-sample fit, and an in-sample fit with an
+    unpenalised intercept leaves residuals that sum to zero. The flag says the
+    residual is in-sample so the report can say it too."""
+    tracking, losses = _crowd_scene({"H0": 20, "H1": 20, "H2": 20})
+    scored = _score(tracking, losses)
+    with_baseline = add_expected_recovery(scored, loss_features(scored, tracking))
+    assert with_baseline.attrs["residual_out_of_sample"] is False
+    residual = with_baseline.loc[with_baseline["scored"], "recovery_residual"]
+    assert float(residual.mean()) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_the_per_team_table_keeps_the_residual_columns_in_a_fixed_order() -> None:
+    """A table prints its column names, so the order is part of the contract."""
+    tracking, losses = _crowd_scene({"H0": 8, "H1": 8})
+    scored = _score(tracking, losses)
+    teams = per_team(add_expected_recovery(scored, loss_features(scored, tracking)))
+    columns = list(teams.columns)
+    assert columns.index("mean_expected") == columns.index("mean_recovery_alt") + 1
+    assert columns.index("mean_residual") == columns.index("mean_expected") + 1

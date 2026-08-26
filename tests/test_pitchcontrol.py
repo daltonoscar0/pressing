@@ -123,7 +123,11 @@ def test_time_to_control_formula_reproduces_the_constant() -> None:
 
 
 def test_int_dt_above_the_stability_boundary_is_rejected() -> None:
-    """dt is a stability boundary, not an accuracy knob: dt>=0.08 diverges to ~1e42."""
+    """dt is an accuracy guard, not a stability boundary: the integrator does
+    not diverge at a coarse timestep, it overshoots by one Euler step and the
+    renormalise clamp then divides the overshoot back out so nothing downstream
+    can tell. See MAX_STABLE_INT_DT in pitchcontrol.py for the measured numbers.
+    """
     PitchControlParams(int_dt=MAX_STABLE_INT_DT)  # exactly on the boundary is allowed
     for bad in (0.061, 0.08, 0.1, 0.2):
         with pytest.raises(ValueError, match="stability limit"):

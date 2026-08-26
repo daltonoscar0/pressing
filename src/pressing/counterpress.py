@@ -162,6 +162,35 @@ tracked presence, not an assumed 90.
 measured from the losing team's own goal. ``per_team`` and ``team_comparison``
 give the head-to-head the report's cover page needs.
 
+The residual, and why a per-player level is not the number
+----------------------------------------------------------
+A pooled per-player mean of ``recovery`` is a map of where that player stands.
+Measured over the 27 rows the report actually prints for Metrica game 1, a
+cubic in the attacking fraction of the turnover -- position and nothing else --
+predicts the printed ``Recovery 5 s`` column at ``r = +0.9770``,
+``R2 = 0.9546``, Spearman ``+0.9383``; the player's own mean turnover position,
+alone, reaches ``R2 = 0.9583``. At loss level a straight line in ``x_norm``
+explains ``R2 = 0.8212``.
+
+:mod:`pressing.baseline` exists to subtract that. Give
+:func:`~pressing.baseline.add_expected_recovery` a scored-loss frame and it adds
+``recovery_expected`` -- what a team losing the ball in that place, in that
+shape, was going to get -- and ``recovery_residual``, the difference. When the
+frame carries those two columns :func:`per_player` and :func:`per_phase` pick
+them up automatically and report the residual alongside the level, and
+:func:`per_player` also attaches a bootstrap interval and the
+:data:`~pressing.baseline.MIN_LOSSES_FOR_PLAYER` suppression flag.
+
+The result is not flattering and is not meant to be. On this match the residual
+separates players at a 5,000-shuffle permutation ``p = 0.4371``; across both
+Metrica matches, shuffling within team and match, ``p = 0.1944``. The raw
+per-phase columns do no better -- ``p = 0.8696`` (build-up), ``0.1144``
+(middle), ``0.1502`` (final third) on game 1. Two matches and roughly twenty
+losses a player cannot support a per-player counter-press claim, and the tables
+here are built to say that rather than to hide it. See
+:mod:`pressing.baseline` for the full numbers and the arithmetic behind the
+threshold.
+
 Cost
 ----
 Scoring a match is the expensive part and it parallelises cleanly, so
@@ -195,6 +224,12 @@ import numpy as np
 import pandas as pd
 
 from pressing._io import METRICA_FPS
+from pressing.baseline import (
+    MIN_LOSSES_FOR_PLAYER,
+    RESIDUAL_COLUMNS,
+    bootstrap_mean_ci,
+    reportable_mask,
+)
 from pressing.epv import epv_surface
 from pressing.phases import PHASES, label_loss_phases
 from pressing.pitchcontrol import (
@@ -1556,12 +1591,48 @@ def _attribution(
     return out.sort_values(["loss_id", "player_id"], ignore_index=True)
 
 
+#: Seed for the per-player bootstrap in :func:`per_player`.
+#:
+#: Fixed rather than drawn, because the demo PDF is required to be
+#: byte-identical between runs and a resampled confidence interval printed on
+#: page 6 would break that. Pass ``rng`` to :func:`per_player` to override it.
+BOOTSTRAP_SEED: Final[int] = 20250826
+
+#: Resamples behind every per-player interval. 2,000 puts the Monte-Carlo error
+#: on a 95% percentile bound at roughly a tenth of the interval's own width,
+#: which is far finer than the numbers being bounded deserve.
+BOOTSTRAP_RESAMPLES: Final[int] = 2000
+
+#: The columns :func:`per_player` adds when the losses carry a residual.
+#: ``reportable`` is the print/suppress decision; see
+#: :data:`pressing.baseline.MIN_LOSSES_FOR_PLAYER`.
+RESIDUAL_PLAYER_COLUMNS: Final[tuple[str, ...]] = (
+    "mean_expected",
+    "mean_residual",
+    "residual_lo",
+    "residual_hi",
+    "recovery_lo",
+    "recovery_hi",
+)
+
+
+def _interval(
+    values: pd.Series,
+    n_boot: int,
+    rng: np.random.Generator,
+) -> tuple[float, float]:
+    """Bootstrap interval for one player's mean, or NaNs when empty."""
+    return bootstrap_mean_ci(values.to_numpy(dtype=np.float64), n_boot=n_boot, rng=rng)
+
+
 def per_player(
     losses: pd.DataFrame,
     tracking: pd.DataFrame,
     radius_m: float = DEFAULT_RADIUS_M,
     *,
     fps: float | None = None,
+    n_boot: int = BOOTSTRAP_RESAMPLES,
+    rng: np.random.Generator | None = None,
 ) -> pd.DataFrame:
     """Aggregate counter-press performance per player.
 
@@ -1575,24 +1646,61 @@ def per_player(
     other one, exactly as in :func:`per_team`. See that function for why the two
     are never the same column under two names.
 
+    **Read ``mean_residual``, not ``mean_recovery``.** When ``losses`` carries
+    ``recovery_expected`` and ``recovery_residual`` -- put there by
+    :func:`pressing.baseline.add_expected_recovery` -- this table also reports
+    the residual, a bootstrap 95% interval on both the level and the residual,
+    and a ``reportable`` flag that is False for any player with fewer than
+    :data:`pressing.baseline.MIN_LOSSES_FOR_PLAYER` nearby losses. The flag is
+    the same rule season mode applies when it refuses a per-90 below 270
+    minutes: below the threshold the number is not printed, because its
+    interval is wider than the whole column. Without those columns every
+    residual field is NaN and ``reportable`` still tells the caller which rows
+    have the counts to be worth printing.
+
     Args:
-        losses: Scored losses from :func:`score_losses`.
+        losses: Scored losses from :func:`score_losses`, optionally carrying
+            :data:`pressing.baseline.RESIDUAL_COLUMNS`.
         tracking: Canonical tracking frame for the match.
         radius_m: Proximity threshold in metres.
         fps: Tracking rate. Defaults to ``tracking.attrs["fps"]``.
+        n_boot: Bootstrap resamples per interval.
+        rng: Random generator for the bootstrap. Defaults to a generator seeded
+            with :data:`BOOTSTRAP_SEED`, so the table -- and the PDF built on it
+            -- is identical between runs.
 
     Returns:
         One row per player with ``team``, ``player_id``, ``jersey``,
         ``minutes``, ``losses_nearby``, ``mean_distance_m``, ``mean_recovery``,
         ``mean_recovery_alt``, ``epv_conceded``, ``regain_rate``,
-        ``losses_per_90``, and per-phase ``losses_<phase>`` /
-        ``recovery_<phase>`` splits. ``attrs["weighting"]`` and
-        ``attrs["alt_weighting"]`` name the two recovery columns.
+        ``losses_per_90``, per-phase ``losses_<phase>`` / ``recovery_<phase>``
+        / ``residual_<phase>`` / ``reportable_<phase>`` splits, the
+        :data:`RESIDUAL_PLAYER_COLUMNS` and ``reportable``.
+        ``attrs["weighting"]`` and ``attrs["alt_weighting"]`` name the two
+        recovery columns; ``attrs["min_losses_for_player"]`` records the
+        threshold and ``attrs["residual_out_of_sample"]`` is carried through
+        from ``losses`` when it is there.
     """
     rate = float(fps if fps is not None else tracking.attrs.get("fps", METRICA_FPS))
     weighting = headline_weighting(losses)
     alternate = alternate_weighting(weighting)
+    generator = np.random.default_rng(BOOTSTRAP_SEED) if rng is None else rng
     minutes = minutes_played(tracking, rate)
+    has_residual = all(column in losses.columns for column in RESIDUAL_COLUMNS)
+    # Read once: the frame is rebuilt below when it has no residual columns,
+    # and ``assign`` is not obliged to carry attrs across.
+    out_of_sample = losses.attrs.get("residual_out_of_sample")
+
+    def stamp(frame: pd.DataFrame) -> pd.DataFrame:
+        """Attach the attrs every per-player table carries."""
+        frame.attrs["weighting"] = weighting
+        frame.attrs["alt_weighting"] = alternate
+        frame.attrs["min_losses_for_player"] = MIN_LOSSES_FOR_PLAYER
+        frame.attrs["has_residual"] = has_residual
+        if out_of_sample is not None:
+            frame.attrs["residual_out_of_sample"] = out_of_sample
+        return frame
+
     if losses.empty:
         # Same columns as a populated table, so the report never has to branch.
         blank = minutes.assign(
@@ -1604,29 +1712,33 @@ def per_player(
             epv_conceded=np.nan,
             regain_rate=np.nan,
             losses_per_90=np.nan,
+            reportable=False,
         )
+        for column in RESIDUAL_PLAYER_COLUMNS:
+            blank[column] = np.nan
         for phase in PHASES:
             blank[f"losses_{phase}"] = 0
             blank[f"recovery_{phase}"] = np.nan
-        blank.attrs["weighting"] = weighting
-        blank.attrs["alt_weighting"] = alternate
-        return blank
+            blank[f"residual_{phase}"] = np.nan
+            blank[f"reportable_{phase}"] = False
+        return stamp(blank)
 
     credited = _attribution(losses, tracking, radius_m)
 
-    metrics = losses.loc[
-        :,
-        [
-            "loss_id",
-            "phase",
-            "recovery",
-            f"recovery_{alternate}",
-            "epv_conceded",
-            "regained_within_5s",
-            "scored",
-        ],
+    wanted = [
+        "loss_id",
+        "phase",
+        "recovery",
+        f"recovery_{alternate}",
+        "epv_conceded",
+        "regained_within_5s",
+        "scored",
+        *RESIDUAL_COLUMNS,
     ]
-    joined = credited.merge(metrics, on="loss_id", how="left")
+    # Without a baseline the residual columns exist and are NaN, so the table
+    # below has one shape and the report never has to branch on which it got.
+    source = losses if has_residual else losses.assign(**dict.fromkeys(RESIDUAL_COLUMNS, np.nan))
+    joined = credited.merge(source.loc[:, wanted], on="loss_id", how="left")
 
     grouped = joined.groupby(["team", "player_id"], observed=True, sort=True)
     table = grouped.agg(
@@ -1634,10 +1746,30 @@ def per_player(
         mean_distance_m=("distance_m", "mean"),
         mean_recovery=("recovery", "mean"),
         mean_recovery_alt=(f"recovery_{alternate}", "mean"),
+        mean_expected=("recovery_expected", "mean"),
+        mean_residual=("recovery_residual", "mean"),
         epv_conceded=("epv_conceded", "mean"),
         regain_rate=("regained_within_5s", "mean"),
         scored_losses=("scored", "sum"),
     ).reset_index()
+
+    bounds: list[dict[str, Any]] = []
+    for (team, player_id), block in grouped:
+        recovery_lo, recovery_hi = _interval(block["recovery"], n_boot, generator)
+        residual_lo, residual_hi = _interval(block["recovery_residual"], n_boot, generator)
+        bounds.append(
+            {
+                "team": team,
+                "player_id": player_id,
+                "recovery_lo": recovery_lo,
+                "recovery_hi": recovery_hi,
+                "residual_lo": residual_lo,
+                "residual_hi": residual_hi,
+            }
+        )
+    interval_columns = ["recovery_lo", "recovery_hi", "residual_lo", "residual_hi"]
+    intervals = pd.DataFrame(bounds, columns=["team", "player_id", *interval_columns])
+    table = table.merge(intervals, on=["team", "player_id"], how="left")
 
     for phase in PHASES:
         block = joined[joined["phase"] == phase]
@@ -1645,6 +1777,7 @@ def per_player(
             **{
                 f"losses_{phase}": ("loss_id", "size"),
                 f"recovery_{phase}": ("recovery", "mean"),
+                f"residual_{phase}": ("recovery_residual", "mean"),
             }
         )
         table = table.merge(counts.reset_index(), on=["team", "player_id"], how="left")
@@ -1655,13 +1788,13 @@ def per_player(
     out["scored_losses"] = out["scored_losses"].fillna(0).astype(int)
     for phase in PHASES:
         out[f"losses_{phase}"] = out[f"losses_{phase}"].fillna(0).astype(int)
+        out[f"reportable_{phase}"] = reportable_mask(out[f"losses_{phase}"])
+    out["reportable"] = reportable_mask(out["losses_nearby"])
     out["losses_per_90"] = np.where(
         out["minutes"] > 0, out["losses_nearby"] / out["minutes"] * 90.0, np.nan
     )
     out = out.sort_values(["team", "losses_nearby"], ascending=[True, False], ignore_index=True)
-    out.attrs["weighting"] = weighting
-    out.attrs["alt_weighting"] = alternate
-    return out
+    return stamp(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1679,12 +1812,18 @@ def per_player(
 #: is which is stated on the frame: ``attrs["weighting"]`` names the headline
 #: and ``attrs["alt_weighting"]`` the alternate, and
 #: :data:`WEIGHTING_LABELS` turns either into words for a table heading.
+#: ``mean_expected`` and ``mean_residual`` are NaN unless the losses carry
+#: :data:`pressing.baseline.RESIDUAL_COLUMNS`. When they do, ``mean_residual``
+#: is the honest version of ``mean_recovery``: the level with the effect of
+#: where the ball was lost, and the shape the team was in, taken out.
 _AGG_COLUMNS: Final[tuple[str, ...]] = (
     "losses",
     "scored_losses",
     "mean_recovery",
     "median_recovery",
     "mean_recovery_alt",
+    "mean_expected",
+    "mean_residual",
     "mean_epv_conceded",
     "total_epv_conceded",
     "regain_rate",
@@ -1704,12 +1843,21 @@ def _aggregate(block: pd.DataFrame, alt_column: str) -> dict[str, Any]:
     """
     scored = block[block["scored"]]
     has_alt = len(scored) > 0 and alt_column in scored.columns
+
+    def mean_of(column: str) -> float:
+        """Mean of an optional column, NaN when it is absent or empty."""
+        if not len(scored) or column not in scored.columns:
+            return float("nan")
+        return float(scored[column].mean())
+
     return {
         "losses": int(len(block)),
         "scored_losses": int(len(scored)),
         "mean_recovery": float(scored["recovery"].mean()) if len(scored) else np.nan,
         "median_recovery": float(scored["recovery"].median()) if len(scored) else np.nan,
         "mean_recovery_alt": float(scored[alt_column].mean()) if has_alt else np.nan,
+        "mean_expected": mean_of("recovery_expected"),
+        "mean_residual": mean_of("recovery_residual"),
         "mean_epv_conceded": float(scored["epv_conceded"].mean()) if len(scored) else np.nan,
         "total_epv_conceded": float(scored["epv_conceded"].sum()) if len(scored) else np.nan,
         "regain_rate": float(block["regained_within_5s"].mean()) if len(block) else np.nan,
