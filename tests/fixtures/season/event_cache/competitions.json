@@ -1,0 +1,20 @@
+[
+ {
+  "competition_id": 99,
+  "season_id": 1,
+  "country_name": "Nowhere",
+  "competition_name": "Fake Liga",
+  "season_name": "2019/2020",
+  "competition_gender": "male",
+  "match_available": "2026-01-01T00:00:00.000000"
+ },
+ {
+  "competition_id": 99,
+  "season_id": 2,
+  "country_name": "Nowhere",
+  "competition_name": "Fake Liga",
+  "season_name": "2020/2021",
+  "competition_gender": "male",
+  "match_available": "2026-01-01T00:00:00.000000"
+ }
+]

@@ -1,0 +1,86 @@
+[
+ {
+  "match_id": 700001,
+  "match_date": "2019-08-17",
+  "competition": {
+   "competition_id": 99,
+   "country_name": "Nowhere",
+   "competition_name": "Fake Liga"
+  },
+  "season": {
+   "season_id": 1,
+   "season_name": "2019/2020"
+  },
+  "home_team": {
+   "home_team_id": 101,
+   "home_team_name": "Alpha FC"
+  },
+  "away_team": {
+   "away_team_id": 102,
+   "away_team_name": "Beta CF"
+  }
+ },
+ {
+  "match_id": 700002,
+  "match_date": "2019-08-18",
+  "competition": {
+   "competition_id": 99,
+   "country_name": "Nowhere",
+   "competition_name": "Fake Liga"
+  },
+  "season": {
+   "season_id": 1,
+   "season_name": "2019/2020"
+  },
+  "home_team": {
+   "home_team_id": 103,
+   "home_team_name": "Gamma SC"
+  },
+  "away_team": {
+   "away_team_id": 104,
+   "away_team_name": "Delta AC"
+  }
+ },
+ {
+  "match_id": 700003,
+  "match_date": "2020-01-11",
+  "competition": {
+   "competition_id": 99,
+   "country_name": "Nowhere",
+   "competition_name": "Fake Liga"
+  },
+  "season": {
+   "season_id": 1,
+   "season_name": "2019/2020"
+  },
+  "home_team": {
+   "home_team_id": 102,
+   "home_team_name": "Beta CF"
+  },
+  "away_team": {
+   "away_team_id": 103,
+   "away_team_name": "Gamma SC"
+  }
+ },
+ {
+  "match_id": 700004,
+  "match_date": "2020-05-09",
+  "competition": {
+   "competition_id": 99,
+   "country_name": "Nowhere",
+   "competition_name": "Fake Liga"
+  },
+  "season": {
+   "season_id": 1,
+   "season_name": "2019/2020"
+  },
+  "home_team": {
+   "home_team_id": 104,
+   "home_team_name": "Delta AC"
+  },
+  "away_team": {
+   "away_team_id": 101,
+   "away_team_name": "Alpha FC"
+  }
+ }
+]
