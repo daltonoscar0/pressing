@@ -7,12 +7,23 @@ Four subcommands mirror the four ways the tool gets used::
     pressing season --source statsbomb --competition "La Liga"
     pressing demo
 
-Two of them work. ``report`` builds the six-page PDF from a real match, and
-``demo`` does the same for the match bundled under ``data/demo/`` with no
-network and no ``data/raw/``. ``proxy`` and ``season`` have no model behind
-them yet, and say so in one line and exit :data:`NOT_BUILT` rather than raising
-through a traceback: an unbuilt feature is not a crash, and it should not read
-like one.
+``report`` builds the six-page PDF from a real match and ``demo`` does the same
+for the match bundled under ``data/demo/`` with no network. ``proxy`` runs the
+event-only model over a StatsBomb events file and writes per-turnover estimates.
+``season`` runs that model across a whole competition and writes the ranking CSV
+and the market-value scatter.
+
+``proxy`` writes a CSV, not a PDF, and that is a limit rather than a shortcut.
+Three of the report's six pages are pitch-control heatmaps and its player table
+is built by attributing tracked positions at the moment of the loss; none of
+that exists in an event stream. A PDF in the report's shape with those pages
+blank would look like a report that had failed rather than a different, smaller
+thing that succeeded.
+
+A subcommand whose feature genuinely does not exist -- an event source that has
+not been wired up -- says so in one line and exits :data:`NOT_BUILT` rather than
+raising through a traceback: an unbuilt feature is not a crash, and it should
+not read like one.
 
 Exit codes: 0 success, 1 the run could not proceed, 2 a usage error (click's,
 not ours -- a bad flag), 3 the feature is not built.
@@ -73,7 +84,9 @@ def _not_built(what: str, why: str) -> NoReturn:
     typer.secho(f"`pressing {what}` is not built yet.", fg=typer.colors.YELLOW, err=True)
     typer.secho(why, err=True)
     typer.secho(
-        "Working today: `pressing demo` and `pressing report`. See TODO.md.", err=True
+        "Working today: `pressing demo`, `pressing report`, `pressing proxy` and "
+        "`pressing season --source statsbomb`. See TODO.md.",
+        err=True,
     )
     raise typer.Exit(code=NOT_BUILT)
 
@@ -343,22 +356,75 @@ def report(
 
 @app.command()
 def proxy(
-    events: Annotated[Path, typer.Argument(help="Events file for the match.")],
+    events: Annotated[Path, typer.Argument(help="StatsBomb events JSON for one match.")],
     team: Annotated[
-        str | None, typer.Option("--team", help="Team the report is written for.")
+        str | None,
+        typer.Option("--team", help="Only keep turnovers this team lost. Exact name."),
     ] = None,
-    out: Annotated[Path, typer.Option("--out", help="Destination PDF.")] = Path(
-        "out/report_proxy.pdf"
-    ),
+    out: Annotated[
+        Path, typer.Option("--out", help="Destination CSV of per-turnover estimates.")
+    ] = Path("out/proxy_estimates.csv"),
+    model_path: Annotated[
+        Path | None, typer.Option("--model", help="Model artefact. Defaults to the bundled one.")
+    ] = None,
 ) -> None:
-    """[NOT BUILT YET] Build the report from events only, as proxy estimates."""
-    _not_built(
-        "proxy",
-        "There is no trained event-only model in this repository. The report "
-        "template can already watermark itself as an estimate, but nothing "
-        "produces the estimates, and printing a report full of numbers that "
-        "were never computed would be worse than printing nothing.",
-    )
+    """Estimate the counter-press metric from an events file, with no tracking."""
+    if not events.is_file():
+        _fail(f"no such events file: {events}")
+
+    from pressing import proxy as proxy_model
+
+    try:
+        model = proxy_model.load_bundled_model(model_path)
+    except (FileNotFoundError, TypeError) as exc:
+        _fail(str(exc))
+
+    frame = _read(proxy_model.load_statsbomb_events, events, "StatsBomb events file")
+    estimates = proxy_model.predict(model, frame)
+    if estimates.empty:
+        _fail(
+            f"{events} yielded no open-play turnovers. A file of only Starting XI and "
+            "Half Start events, or a possession stream with no team changes, produces "
+            "nothing to score."
+        )
+
+    if team is not None:
+        teams = sorted(set(estimates["losing_team"].astype(str)))
+        if team not in teams:
+            _fail(f"--team {team!r} is not in this match. Teams: {', '.join(teams)}")
+        estimates = estimates[estimates["losing_team"] == team]
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    header = [
+        "# pressing proxy estimates: counter-press control share per open-play turnover",
+        "# " + _statsbomb_credit(),
+        "# recovery is an ESTIMATE from an event-only model, not a measurement. The model "
+        "composes to r ~ 0.18 against the tracking-derived metric it stands in for; see "
+        "models/MODEL_CARD.md before quoting any single value.",
+        "# recovery is driven by WHERE the ball was lost (Metrica game 1 phase means: "
+        "build-up 0.26, middle 0.47, final third 0.70). Compare only within a phase.",
+        "# epv_conceded is empty on purpose: EPV needs the opponent's control surface, "
+        "which cannot be recovered from events.",
+    ]
+    out.write_text("\n".join(header) + "\n" + estimates.to_csv(index=False))
+
+    _echo(f"{len(estimates)} open-play turnovers estimated")
+    by_phase = estimates.groupby("phase", dropna=False)["recovery"].agg(["count", "mean"])
+    for phase, row in by_phase.iterrows():
+        _echo(f"  {str(phase):<12} n={int(row['count']):>4}  mean recovery {row['mean']:.3f}")
+    _echo("recovery values are comparable only within a phase")
+    typer.echo(str(out))
+
+
+def _statsbomb_credit() -> str:
+    """The StatsBomb attribution line stamped on every event-derived output.
+
+    Returns:
+        The credit text.
+    """
+    from pressing.season import STATSBOMB_ATTRIBUTION
+
+    return STATSBOMB_ATTRIBUTION
 
 
 @app.command()
@@ -368,19 +434,114 @@ def season(
         str, typer.Option("--competition", help="Competition name.")
     ] = "La Liga",
     season_label: Annotated[
-        str | None, typer.Option("--season", help="Season label. Defaults to the latest.")
+        str | None,
+        typer.Option(
+            "--season",
+            help=(
+                "Season label, e.g. '2015/2016'. Defaults to the season with the MOST "
+                "matches, not the most recent one: La Liga's latest open season has 35 "
+                "matches and its largest has 380."
+            ),
+        ),
     ] = None,
     out_dir: Annotated[
         Path, typer.Option("--out-dir", help="Directory for the csv and scatter PNG.")
     ] = Path("out"),
+    limit: Annotated[
+        int | None,
+        typer.Option(
+            "--limit",
+            "--matches",
+            min=1,
+            help=(
+                "Process only this many matches, spread evenly across the season. A full "
+                "La Liga 2015/16 pull is 380 events files plus 380 lineups at one request "
+                "per second."
+            ),
+        ),
+    ] = None,
+    min_minutes: Annotated[
+        float,
+        typer.Option(
+            "--min-minutes",
+            min=0.0,
+            help="Minutes a player needs before a per-90 rate is reported at all.",
+        ),
+    ] = 270.0,
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Never touch the network. Uses only what is already cached.",
+        ),
+    ] = False,
+    cache_dir: Annotated[
+        Path,
+        typer.Option("--cache-dir", help="StatsBomb cache root, mirroring their data/ layout."),
+    ] = Path("data/raw/statsbomb"),
+    values_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--values-dir",
+            help=(
+                "Directory holding players.csv.gz and player_valuations.csv.gz. Defaults to "
+                "data/raw/transfermarkt, falling back to the committed snapshot."
+            ),
+        ),
+    ] = None,
 ) -> None:
-    """[NOT BUILT YET] Rank players league-wide against market values."""
-    _not_built(
-        "season",
-        "Season mode ranks a whole competition through the event proxy, which "
-        "does not exist yet, and joins market values from a source this "
-        "repository has not been wired to. Neither half is built.",
+    """Rank a competition's players by counter-pressing and price them."""
+    if source.lower() != "statsbomb":
+        _not_built(
+            f"season --source {source}",
+            "StatsBomb is the only open source with both an event stream and the lineup "
+            "files the market-value join needs. SkillCorner ships no events at all, and "
+            "Metrica is three matches.",
+        )
+
+    from pressing.season import MIN_SEASON_MATCHES, run_season
+
+    try:
+        result = run_season(
+            source,
+            competition,
+            season_label,
+            out_dir,
+            limit=limit,
+            cache_dir=cache_dir,
+            tm_cache_dir=values_dir,
+            allow_download=not offline,
+            min_minutes=min_minutes,
+            progress=_echo,
+        )
+    except LookupError as exc:
+        _fail(str(exc))
+    except FileNotFoundError as exc:
+        _fail(f"{exc}. Drop --offline to fetch what is missing.")
+
+    _echo("")
+    _echo(
+        f"{result.spec.label}: {result.n_matches_used} of {result.spec.n_matches} matches, "
+        f"{result.n_turnovers:,} open-play turnovers, {result.n_players} players "
+        f"({result.n_ranked} with enough minutes to rank)"
     )
+    _echo(
+        f"market-value join: {result.n_matched} of {result.n_players} "
+        f"({100.0 * result.join_rate:.1f}%) priced; {result.n_no_valuation} with no valuation "
+        f"in the season window; {result.n_ambiguous} dropped as ambiguous rather than guessed; "
+        f"{result.n_unmatched} not found"
+    )
+    _echo(
+        f"values from the {result.values_source}, data current to {result.values_as_of}; "
+        f"scatter has {result.n_plotted} points"
+    )
+    for warning in result.warnings:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW, err=True)
+    if result.n_matches_used < MIN_SEASON_MATCHES:
+        _echo("per-90 rates from a sample are noise; treat the ranking accordingly")
+
+    typer.echo(str(result.csv_path))
+    typer.echo(str(result.png_path))
 
 
 @app.command()

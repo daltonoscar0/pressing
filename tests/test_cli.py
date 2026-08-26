@@ -6,10 +6,11 @@ reach the functions behind them -- ``--jobs``, ``--team``, ``--rank`` and
 because the pipeline itself is tested in ``test_demo.py`` and running it again
 per flag would cost minutes to prove routing.
 
-Second, that the two unbuilt subcommands fail like a tool and not like a bug.
-``pressing proxy`` and ``pressing season`` have no model behind them, and the
-requirement is a clear sentence and a distinct exit code -- never a traceback,
-and never a plausible-looking PDF full of numbers nobody computed.
+Second, that a subcommand asked for something the tool does not do fails like a
+tool and not like a bug: a clear sentence and a distinct exit code, never a
+traceback, and never a plausible-looking output full of numbers nobody
+computed. ``proxy`` and ``season`` are both built now, so the case that remains
+is an event source that has not been wired up.
 
 Third, that the exit codes stay meaningful. Success, "this run broke", "you
 typed it wrong" and "that feature does not exist" are four different things a
@@ -47,15 +48,18 @@ def test_help_lists_every_subcommand() -> None:
         assert name in result.output
 
 
-@pytest.mark.parametrize("command", ["proxy", "season"])
-def test_help_says_up_front_which_subcommands_are_unbuilt(command: str) -> None:
-    """Finding out only after you have typed the arguments is finding out late.
+@pytest.mark.parametrize("command", ["report", "proxy", "season", "demo"])
+def test_no_subcommand_is_advertised_as_unbuilt_any_more(command: str) -> None:
+    """All four do something now, so none of them may claim otherwise.
 
-    Both of these have fully specified flags, so their help screens read like
-    working commands unless the summary line says otherwise.
+    This test used to assert the opposite: that ``proxy`` and ``season`` said
+    "NOT BUILT YET" on their own help screens, because finding out only after
+    typing the arguments is finding out late. The same reasoning now runs the
+    other way -- a working command that still advertises itself as unbuilt is a
+    command nobody will type.
     """
-    assert "NOT BUILT YET" in _run(command, "--help").output
-    assert "NOT BUILT YET" in _run("--help").output
+    assert "NOT BUILT YET" not in _run(command, "--help").output
+    assert "NOT BUILT YET" not in _run("--help").output
 
 
 def test_version() -> None:
@@ -90,27 +94,24 @@ def test_help_does_not_import_matplotlib() -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    ("args", "what"),
-    [
-        (("proxy", "events.json"), "proxy"),
-        (("season", "--competition", "La Liga"), "season"),
-    ],
-)
-def test_unbuilt_subcommands_say_so_and_exit_two(args: tuple[str, ...], what: str) -> None:
-    result = _run(*args)
+@pytest.mark.parametrize("source", ["skillcorner", "metrica", "opta"])
+def test_an_unwired_event_source_says_so_and_exits_three(source: str) -> None:
+    """StatsBomb is the only source with events and lineups both."""
+    result = _run("season", "--source", source, "--competition", "La Liga")
     assert result.exit_code == NOT_BUILT
     assert result.exception is None or isinstance(result.exception, SystemExit)
-    assert f"`pressing {what}` is not built yet." in result.output
+    assert f"`pressing season --source {source}` is not built yet." in result.output
     assert "Traceback" not in result.output
     # It has to point somewhere that works, or the message is a dead end.
     assert "pressing demo" in result.output
+    assert "pressing season --source statsbomb" in result.output
 
 
 def test_unbuilt_exit_code_is_distinct_from_a_failed_run() -> None:
     """A tool that cannot do something is not the same as a run that broke."""
     assert NOT_BUILT != 1
-    assert _run("proxy", "e.json").exit_code == NOT_BUILT
+    assert _run("season", "--source", "skillcorner").exit_code == NOT_BUILT
+    assert _run("proxy", "no_such_events.json").exit_code == 1
     assert _run("report", "nope.csv", "--team", "home").exit_code == 1
 
 
@@ -126,7 +127,8 @@ def test_unbuilt_exit_code_is_also_distinct_from_a_typo() -> None:
     assert _run("demo", "--jobs", "0").exit_code == USAGE_ERROR
     assert _run("demo", "--rank", "nonsense").exit_code == USAGE_ERROR
     assert _run("demo", "--no-such-flag").exit_code == USAGE_ERROR
-    assert _run("season").exit_code == NOT_BUILT
+    assert _run("season", "--limit", "0").exit_code == USAGE_ERROR
+    assert _run("season", "--source", "skillcorner").exit_code == NOT_BUILT
 
 
 # --------------------------------------------------------------------------- #
