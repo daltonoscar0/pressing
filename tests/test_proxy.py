@@ -829,6 +829,212 @@ def test_loading_a_missing_artefact_says_how_to_make_one(tmp_path: Path) -> None
         proxy.load_bundled_model(tmp_path / "absent.pkl.gz")
 
 
+def test_an_unknown_model_variant_is_rejected_by_name() -> None:
+    """A typo must not silently resolve to the deployable model."""
+    with pytest.raises(ValueError, match="unknown model variant"):
+        proxy.bundled_model_path("held_out")
+
+
+# --------------------------------------------------------------------------- #
+# Determinism
+# --------------------------------------------------------------------------- #
+
+
+def test_the_dataset_row_order_does_not_depend_on_completion_order() -> None:
+    """Row order is a correctness property here, not a tidiness one.
+
+    ``HistGradientBoostingRegressor`` draws its early-stopping validation slice
+    out of the design matrix by position, so two frames with identical content in
+    a different row order fit to different trees. The v0.1.0 parallel dataset
+    build appended each match as its worker finished, which made the training set
+    a race: measured on the 6,195 real labelled rows, three fresh processes on the
+    canonical order all gave held-out ``r`` = 0.369162 stopping at iteration 79
+    with byte-identical predictions, while a row shuffle alone gave 0.369387,
+    0.374414 and 0.368491 stopping at 85, 69 and 85. Assembly must therefore be
+    order-blind.
+    """
+    parts = [
+        pd.DataFrame({"match_id": [7, 7, 7], "loss_index": [0, 1, 2]}),
+        pd.DataFrame({"match_id": [3, 3], "loss_index": [0, 1]}),
+        pd.DataFrame({"match_id": [5], "loss_index": [0]}),
+    ]
+    canonical = proxy._canonical_row_order(parts)
+    for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1]):
+        shuffled = proxy._canonical_row_order([parts[i] for i in order])
+        pd.testing.assert_frame_equal(canonical, shuffled)
+    assert canonical["match_id"].tolist() == [3, 3, 5, 7, 7, 7]
+    # Within a match the natural order survives; the sort is stable.
+    assert canonical["loss_index"].tolist() == [0, 1, 0, 0, 1, 2]
+
+
+def test_an_empty_assembly_gives_an_empty_frame_not_an_exception() -> None:
+    """A cache with nothing in it is a legitimate, reportable state."""
+    assert proxy._canonical_row_order([]).empty
+
+
+def test_refitting_the_same_rows_twice_gives_identical_predictions(
+    toy_dataset: pd.DataFrame,
+) -> None:
+    """With the row order fixed, the fit is reproducible."""
+    first = proxy.train(toy_dataset, toy_dataset["recovery_360"])
+    second = proxy.train(toy_dataset, toy_dataset["recovery_360"])
+    assert np.array_equal(first.predict(toy_dataset), second.predict(toy_dataset))
+    assert first.estimator.n_iter_ == second.estimator.n_iter_
+
+
+# --------------------------------------------------------------------------- #
+# Honest scoring
+# --------------------------------------------------------------------------- #
+
+
+def _with_split_metadata(
+    model: proxy.ProxyModel, frame: pd.DataFrame, train_mask: np.ndarray, fitted_on: str
+) -> proxy.ProxyModel:
+    """Stamp a model with the split metadata a real training run records.
+
+    Args:
+        model: The fitted model to stamp.
+        frame: The dataset it came from.
+        train_mask: Boolean training rows.
+        fitted_on: ``"train_matches"`` or ``"all_labelled"``.
+
+    Returns:
+        The same model, mutated.
+    """
+    model.metadata = {
+        "fitted_on": fitted_on,
+        "train_match_ids": sorted(int(v) for v in frame.loc[train_mask, "match_id"].unique()),
+        "held_out_match_ids": sorted(
+            int(v) for v in frame.loc[~train_mask, "match_id"].unique()
+        ),
+    }
+    return model
+
+
+def test_score_held_out_refuses_a_model_that_saw_the_held_out_rows(
+    toy_dataset: pd.DataFrame,
+) -> None:
+    """The reproduction trap this exists to close.
+
+    The deployable artefact is refitted on every labelled row, so feeding it the
+    documented held-out match ids and reading the correlation is in-sample. On
+    the real dataset that returns r = 0.6151 against an honest 0.3692, with
+    nothing to signal the mistake. Documenting it is not enough; it must raise.
+    """
+    train_mask, _ = proxy.split_by_match(toy_dataset, seed=3)
+    refit = _with_split_metadata(
+        proxy.train(toy_dataset, toy_dataset["recovery_360"]),
+        toy_dataset, train_mask, "all_labelled",
+    )
+    with pytest.raises(ValueError, match="in-sample"):
+        proxy.score_held_out(refit, toy_dataset, toy_dataset["recovery_360"])
+
+
+def test_score_held_out_scores_the_split_model_on_its_own_held_out_matches(
+    toy_dataset: pd.DataFrame,
+) -> None:
+    """The honest path returns the same metrics as scoring the test rows by hand."""
+    train_mask, test_mask = proxy.split_by_match(toy_dataset, seed=3)
+    split = _with_split_metadata(
+        proxy.train(toy_dataset[train_mask], toy_dataset.loc[train_mask, "recovery_360"]),
+        toy_dataset, train_mask, "train_matches",
+    )
+    honest = proxy.score_held_out(split, toy_dataset, toy_dataset["recovery_360"])
+    by_hand = proxy.evaluate(
+        split, toy_dataset[test_mask], toy_dataset.loc[test_mask, "recovery_360"]
+    )
+    assert honest == by_hand
+    assert honest.n_losses == int(test_mask.sum())
+    assert honest.n_matches == len(proxy.held_out_match_ids(split))
+
+
+def test_score_held_out_reports_a_model_that_cannot_say_what_it_saw(
+    toy_dataset: pd.DataFrame,
+) -> None:
+    """An artefact from before the split metadata must not be scored on a guess."""
+    model = proxy.train(toy_dataset, toy_dataset["recovery_360"])
+    with pytest.raises(KeyError, match="held_out_match_ids"):
+        proxy.score_held_out(model, toy_dataset, toy_dataset["recovery_360"])
+    with pytest.raises(KeyError, match="train_match_ids"):
+        proxy.training_match_ids(model)
+
+
+def test_score_held_out_refuses_a_frame_with_none_of_its_matches(
+    toy_dataset: pd.DataFrame,
+) -> None:
+    """Scoring the wrong competition must fail loudly, not return one row."""
+    train_mask, _ = proxy.split_by_match(toy_dataset, seed=3)
+    split = _with_split_metadata(
+        proxy.train(toy_dataset[train_mask], toy_dataset.loc[train_mask, "recovery_360"]),
+        toy_dataset, train_mask, "train_matches",
+    )
+    elsewhere = toy_dataset.assign(match_id=toy_dataset["match_id"] + 500_000)
+    with pytest.raises(ValueError, match="held-out matches appear"):
+        proxy.score_held_out(split, elsewhere, elsewhere["recovery_360"])
+
+
+def test_the_shipped_artefacts_record_which_matches_each_one_saw() -> None:
+    """Both committed artefacts must know their own split, and disagree correctly."""
+    if not proxy.bundled_model_path("split").exists():  # pragma: no cover
+        pytest.skip("no bundled proxy models in this checkout")
+
+    refit = proxy.load_bundled_model(variant="refit")
+    split = proxy.load_bundled_model(variant="split")
+
+    assert refit.metadata["fitted_on"] == "all_labelled"
+    assert split.metadata["fitted_on"] == "train_matches"
+    train_ids = set(proxy.training_match_ids(split))
+    held_out = set(proxy.held_out_match_ids(split))
+    assert train_ids and held_out
+    assert train_ids.isdisjoint(held_out)
+    assert train_ids | held_out == set(proxy.training_match_ids(refit)) | set(
+        proxy.held_out_match_ids(refit)
+    )
+    assert len(train_ids) + len(held_out) == refit.metadata["n_matches"]
+
+
+# --------------------------------------------------------------------------- #
+# The phase caveat
+# --------------------------------------------------------------------------- #
+
+
+def test_the_phase_caveat_quotes_the_models_own_means(toy_dataset: pd.DataFrame) -> None:
+    """A model's recorded phase means win over the package default."""
+    model = proxy.train(
+        toy_dataset,
+        toy_dataset["recovery_360"],
+        metadata={"predicted_phase_means": {
+            "build_up": 0.111, "middle": 0.222, "final_third": 0.333,
+        }},
+    )
+    assert proxy.phase_reference_means(model) == {
+        "build_up": 0.111, "middle": 0.222, "final_third": 0.333,
+    }
+    caveat = " ".join(proxy.recovery_phase_caveat(model))
+    assert "build-up 0.111" in caveat and "final third 0.333" in caveat
+    assert "+0.222" in caveat  # this model's own gradient, 0.333 - 0.111
+
+
+def test_the_phase_caveat_never_offers_the_tracking_scale_as_the_proxys() -> None:
+    """The v0.1.0 header printed 0.26 / 0.47 / 0.70 above proxy numbers.
+
+    Those are the tracking metric's phase means. The proxy's own gradient across
+    pitch thirds is about a sixth of the tracking metric's, so a reader who
+    scaled against them read the proxy's own average as a remarkable press. The
+    tracking figures may still be named, but only inside the sentence that tells
+    you not to scale against them.
+    """
+    scale_line, warning_line = proxy.recovery_phase_caveat()
+    for value in (f"{v:.2f}" for v in proxy.TRACKING_PHASE_MEANS.values()):
+        assert value not in scale_line
+    assert "do NOT scale" in warning_line
+    assert "0.26" in warning_line and "0.70" in warning_line
+    means = proxy.phase_reference_means()
+    assert means["final_third"] - means["build_up"] < 0.25 * (
+        proxy.TRACKING_PHASE_MEANS["final_third"] - proxy.TRACKING_PHASE_MEANS["build_up"]
+    )
+
+
 def test_predict_returns_one_row_per_turnover_with_no_epv(
     toy_dataset: pd.DataFrame, events_frame: pd.DataFrame
 ) -> None:

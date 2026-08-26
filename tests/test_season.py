@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from pressing import proxy as proxy_model
 from pressing import season as S
 
 FIXTURES = Path(__file__).parent / "fixtures" / "season"
@@ -607,7 +608,29 @@ def test_the_csv_carries_the_phase_caveat() -> None:
     result = run()
     text = Path(result.csv_path).read_text()
     assert "Compare only within a phase" in text
-    assert "build-up 0.26" in text
+
+
+def test_the_phase_caveat_prints_the_proxys_own_scale_not_the_tracking_metrics() -> None:
+    """The reference means in the header must be the ones these numbers live on.
+
+    Until v0.1.0 this header printed the tracking metric's phase means -- build-up
+    0.26, middle 0.47, final third 0.70 -- above columns produced by the proxy,
+    whose own gradient across pitch thirds is about a sixth of that. A reader who
+    scaled against the printed numbers would read the proxy's own build-up average
+    as a remarkable press. The tracking figures may still appear, but only inside
+    the sentence that tells you not to scale against them.
+    """
+    result = run()
+    text = Path(result.csv_path).read_text()
+    means = proxy_model.phase_reference_means()
+    assert f"build-up {means['build_up']:.3f}" in text
+    assert f"final third {means['final_third']:.3f}" in text
+    assert "do NOT scale these against the tracking metric" in text
+    header = "\n".join(line for line in text.splitlines() if line.startswith("#"))
+    scale_line = next(
+        line for line in header.splitlines() if "THIS MODEL's own phase means" in line
+    )
+    assert "0.26" not in scale_line and "0.70" not in scale_line
 
 
 def test_the_csv_reads_back_as_a_table() -> None:
@@ -891,8 +914,6 @@ def test_the_cli_explains_an_unknown_competition_rather_than_tracebacking(
 
 def test_proxy_writes_per_turnover_estimates_through_the_cli(tmp_path: Path) -> None:
     """The event-only path produces numbers, stamped as estimates."""
-    from pressing import proxy as proxy_model
-
     if not proxy_model.bundled_model_path().exists():  # pragma: no cover
         pytest.skip("no bundled proxy model in this checkout")
 
@@ -915,8 +936,6 @@ def test_proxy_writes_per_turnover_estimates_through_the_cli(tmp_path: Path) -> 
 
 def test_proxy_refuses_a_team_that_is_not_in_the_match(tmp_path: Path) -> None:
     """A typo in --team must not silently produce an empty table."""
-    from pressing import proxy as proxy_model
-
     if not proxy_model.bundled_model_path().exists():  # pragma: no cover
         pytest.skip("no bundled proxy model in this checkout")
 

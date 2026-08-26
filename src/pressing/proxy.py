@@ -59,11 +59,40 @@ time-to-next-event feature. :func:`absolute_seconds` computes time from a period
 offset plus the parsed timestamp and never touches ``minute``.
 :func:`~tests.test_proxy` regression-tests it.
 
+Two artefacts, and why
+----------------------
+``models/proxy_gbr.pkl.gz`` is refitted on every labelled row and is the model
+you deploy; ``load_bundled_model()`` returns it. ``models/proxy_gbr_split.pkl.gz``
+is fitted on the training matches only and is the model the model card's metrics
+describe. Scoring the first one on the documented held-out matches is in-sample
+and returns roughly r = 0.61 where the honest answer is about 0.39, with nothing
+to say anything went wrong -- so both artefacts record ``fitted_on``,
+``train_match_ids`` and ``held_out_match_ids`` in their metadata, and
+:func:`score_held_out` raises rather than quietly returning the flattering
+number. The mistake is an exception now, not a warning in a document.
+
+Determinism
+-----------
+A refit is reproducible across processes **provided the row order of the
+training set is fixed**, and it is not optional. ``HistGradientBoostingRegressor``
+draws its early-stopping validation slice out of the design matrix by position,
+so two frames with identical content in different row orders fit to different
+trees. :func:`build_dataset` therefore returns a canonical row order that does
+not depend on ``jobs`` or on which worker finished first. Measured on the 6,195
+real labelled rows: three fresh processes on the canonical order gave
+byte-identical predictions and held-out r = 0.369162 each time, while shuffling
+nothing but the row order gave 0.369387, 0.374414 and 0.368491, and the frame the
+v0.1.0 artefact came from gave 0.390659 -- a band of roughly 0.368 to 0.391 on
+one machine with one dataset.
+
 Licence
 -------
 StatsBomb data is never committed. It is cached under the gitignored
 ``data/raw/`` and re-fetched on demand at one request per second. See the README
-for the terms.
+for the terms. The committed artefacts do contain StatsBomb's event-type
+vocabulary, the three competition-season labels and the 97 match ids of the
+training set; see ``models/MODEL_CARD.md`` §6.1, which surfaces that against the
+absolutely-worded "never commit StatsBomb data in any form" decision.
 """
 
 from __future__ import annotations
@@ -138,6 +167,14 @@ __all__ = [
     "points_in_polygon",
     "download_training_set",
     "DEFAULT_TRAINING_COMPETITIONS",
+    "MODEL_VARIANTS",
+    "score_held_out",
+    "held_out_match_ids",
+    "training_match_ids",
+    "phase_reference_means",
+    "recovery_phase_caveat",
+    "PROXY_PHASE_MEANS",
+    "TRACKING_PHASE_MEANS",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -1758,6 +1795,98 @@ def calibration_report(calibration: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Reporting caveats
+# --------------------------------------------------------------------------- #
+
+#: Phase means of the TRACKING metric on Metrica game 1 -- the quantity the proxy
+#: stands in for. Reproduce with
+#: ``uv run pressing report --rank costly`` or, directly,
+#: ``counterpress.score_match(...).groupby("phase")["recovery_area"].mean()``.
+#: These are here as a CONTRAST only. They must never be printed as a reference
+#: scale for a proxy number; see :data:`PROXY_PHASE_MEANS`.
+TRACKING_PHASE_MEANS: Final[dict[str, float]] = {
+    "build_up": 0.257,
+    "middle": 0.468,
+    "final_third": 0.701,
+}
+
+#: Phase means of what the SHIPPED proxy artefact actually predicts, over the
+#: 6,195 labelled training turnovers. Measured with::
+#:
+#:     m = proxy.load_bundled_model()
+#:     lab["pred"] = m.predict(lab)
+#:     lab.groupby("phase")["pred"].mean()
+#:
+#: Recorded here as the fallback for :func:`phase_reference_means` when no model
+#: is to hand; a trained artefact carries its own copy in
+#: ``metadata["predicted_phase_means"]``, which is what callers get in practice.
+PROXY_PHASE_MEANS: Final[dict[str, float]] = {
+    "build_up": 0.464,
+    "middle": 0.490,
+    "final_third": 0.542,
+}
+
+_PHASE_ORDER: Final[tuple[str, ...]] = ("build_up", "middle", "final_third")
+_PHASE_LABELS: Final[dict[str, str]] = {
+    "build_up": "build-up",
+    "middle": "middle",
+    "final_third": "final third",
+}
+
+
+def phase_reference_means(model: ProxyModel | None = None) -> dict[str, float]:
+    """The proxy's OWN mean prediction per pitch third.
+
+    A CSV of proxy estimates needs a reference scale, or "compare only within a
+    phase" gives the reader nothing to compare against. Until v0.1.0 the scale
+    printed in the header was the *tracking* metric's -- build-up 0.26, middle
+    0.47, final third 0.70 -- which is not a scale these numbers live on. The
+    proxy's own gradient across the pitch is about +0.08, roughly a sixth of the
+    tracking metric's +0.44, so a reader who took a proxy build-up value of 0.47
+    against a stated 0.26 would read the proxy's own average as an extraordinary
+    press.
+
+    Args:
+        model: A fitted model whose metadata carries ``predicted_phase_means``.
+            ``None``, or a model trained before that key existed, falls back to
+            the recorded :data:`PROXY_PHASE_MEANS`.
+
+    Returns:
+        ``{phase: mean predicted recovery}`` for build-up, middle, final third.
+    """
+    recorded = dict(model.metadata).get("predicted_phase_means") if model else None
+    source = recorded if isinstance(recorded, dict) and recorded else PROXY_PHASE_MEANS
+    return {p: float(source[p]) for p in _PHASE_ORDER if p in source}
+
+
+def recovery_phase_caveat(model: ProxyModel | None = None) -> list[str]:
+    """The phase caveat for a proxy CSV header, on the proxy's own scale.
+
+    Args:
+        model: Fitted model, for its recorded predicted phase means.
+
+    Returns:
+        Two lines, without the leading ``#``. The first gives the proxy's own
+        phase means and the instruction; the second states the compression
+        against the tracking metric explicitly, so nobody transplants the
+        tracking scale back on.
+    """
+    means = phase_reference_means(model)
+    printed = ", ".join(f"{_PHASE_LABELS[p]} {means[p]:.3f}" for p in _PHASE_ORDER if p in means)
+    proxy_gradient = means.get("final_third", float("nan")) - means.get("build_up", float("nan"))
+    truth_gradient = TRACKING_PHASE_MEANS["final_third"] - TRACKING_PHASE_MEANS["build_up"]
+    return [
+        f"recovery is driven by WHERE the ball was lost. THIS MODEL's own phase means are "
+        f"{printed}. Compare only within a phase.",
+        f"do NOT scale these against the tracking metric's phase means "
+        f"({TRACKING_PHASE_MEANS['build_up']:.2f} / {TRACKING_PHASE_MEANS['middle']:.2f} / "
+        f"{TRACKING_PHASE_MEANS['final_third']:.2f} on Metrica game 1): the proxy's gradient "
+        f"across the pitch is {proxy_gradient:+.3f} against the tracking metric's "
+        f"{truth_gradient:+.3f}, so the two are not on the same scale.",
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
 
@@ -2177,7 +2306,30 @@ def build_dataset(
         verbose: Print per-match progress.
 
     Returns:
-        The concatenated per-match datasets, unlabelled rows included.
+        The concatenated per-match datasets, unlabelled rows included, in a
+        CANONICAL row order: ascending ``match_id``, and within a match the
+        order ``build_match_dataset`` produced (ascending ``loss_index``). The
+        frame does not depend on ``jobs``, on which worker finished first, or on
+        the order ``match_ids`` arrived in.
+
+    Note:
+        That canonical order is correctness, not tidiness. This function used to
+        append each part as its future *completed*, so with ``--jobs 5`` the row
+        order was a race. The content was identical either way, but
+        ``HistGradientBoostingRegressor`` draws its early-stopping validation
+        slice out of the design matrix by position, so a different row order is
+        a different validation slice, a different stopping iteration and a
+        different fitted tree. That is the whole of the "the refit is not
+        reproducible across processes" problem the v0.1.0 audit measured.
+        Measured on the identical 6,195 labelled rows, refitting the split model
+        after nothing but a row shuffle moved the held-out ``r`` to 0.369387,
+        0.374414 and 0.368491 and the stopping iteration to 85, 69 and 85, where
+        three fresh processes on the canonical order all gave 0.369162 stopping
+        at 79 and agreed bit for bit (identical SHA-256 of the held-out
+        prediction vector). Across every row order measured, including the one
+        the v0.1.0 artefact happened to be built from, ``r`` spans roughly 0.368
+        to 0.391. Fix the order and the refit is deterministic; leave it to
+        chance and no printed digit past the second is meaningful.
     """
     if jobs is None or jobs <= 1:
         parts = []
@@ -2185,23 +2337,42 @@ def build_dataset(
             parts.append(build_match_dataset(mid, cache_dir, params=params))
             if verbose:
                 print(f"[{i}/{len(match_ids)}] {mid}: {len(parts[-1])} turnovers", flush=True)
-        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        return _canonical_row_order(parts)
 
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    parts = []
+    slots: list[pd.DataFrame | None] = [None] * len(match_ids)
     with ProcessPoolExecutor(max_workers=int(jobs)) as pool:
         futures = {
-            pool.submit(build_match_dataset, int(mid), str(cache_dir), params): int(mid)
-            for mid in match_ids
+            pool.submit(build_match_dataset, int(mid), str(cache_dir), params): (i, int(mid))
+            for i, mid in enumerate(match_ids)
         }
-        for i, future in enumerate(as_completed(futures), start=1):
-            part = future.result()
-            parts.append(part)
+        for done, future in enumerate(as_completed(futures), start=1):
+            index, mid = futures[future]
+            slots[index] = future.result()
             if verbose:
-                print(f"[{i}/{len(match_ids)}] {futures[future]}: {len(part)} turnovers",
+                print(f"[{done}/{len(match_ids)}] {mid}: {len(slots[index])} turnovers",
                       flush=True)
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return _canonical_row_order([p for p in slots if p is not None])
+
+
+def _canonical_row_order(parts: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate per-match frames into one canonically ordered dataset.
+
+    Args:
+        parts: Per-match frames, in any order.
+
+    Returns:
+        The concatenation sorted by ``match_id`` with a *stable* sort, so each
+        match's own row order survives, and re-indexed from zero. An empty list
+        gives an empty frame.
+    """
+    if not parts:
+        return pd.DataFrame()
+    frame = pd.concat(parts, ignore_index=True)
+    if "match_id" not in frame.columns:
+        return frame
+    return frame.sort_values("match_id", kind="stable").reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -2236,13 +2407,43 @@ def predict(model: ProxyModel, events: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def bundled_model_path() -> Path:
-    """Location of the model artefact shipped with the repository.
+#: The two artefacts the repository ships, and what each is fitted on.
+#:
+#: ``"refit"``
+#:     ``models/proxy_gbr.pkl.gz``. Fitted on EVERY labelled row. This is the one
+#:     you would deploy, and the one :func:`load_bundled_model` returns by
+#:     default. **Its held-out metrics cannot be reproduced with it**: it has
+#:     seen every match, so scoring it on the recorded held-out matches is
+#:     in-sample and flatters itself (measured: r = 0.6151 against a true
+#:     0.3692).
+#: ``"split"``
+#:     ``models/proxy_gbr_split.pkl.gz``. Fitted on the 68 training matches only.
+#:     This is the model the model card's metrics table describes, and the only
+#:     one :func:`score_held_out` will score.
+MODEL_VARIANTS: Final[dict[str, str]] = {
+    "refit": "proxy_gbr.pkl.gz",
+    "split": "proxy_gbr_split.pkl.gz",
+}
+
+
+def bundled_model_path(variant: str = "refit") -> Path:
+    """Location of a model artefact shipped with the repository.
+
+    Args:
+        variant: ``"refit"`` (all labelled rows, the deployable model) or
+            ``"split"`` (training matches only, the model the metrics describe).
 
     Returns:
-        Path to ``models/proxy_gbr.pkl.gz``, whether or not it exists.
+        Path to the artefact, whether or not it exists.
+
+    Raises:
+        ValueError: If ``variant`` is not one of :data:`MODEL_VARIANTS`.
     """
-    return Path(__file__).resolve().parents[2] / "models" / "proxy_gbr.pkl.gz"
+    if variant not in MODEL_VARIANTS:
+        raise ValueError(
+            f"unknown model variant {variant!r}; expected one of {sorted(MODEL_VARIANTS)}"
+        )
+    return Path(__file__).resolve().parents[2] / "models" / MODEL_VARIANTS[variant]
 
 
 def save_model(model: ProxyModel, path: Path | str | None = None) -> Path:
@@ -2265,15 +2466,19 @@ def save_model(model: ProxyModel, path: Path | str | None = None) -> Path:
     return destination
 
 
-def load_bundled_model(path: Path | None = None) -> ProxyModel:
-    """Load the model shipped with the package.
+def load_bundled_model(path: Path | None = None, *, variant: str = "refit") -> ProxyModel:
+    """Load a model shipped with the package.
 
     The artefact is a pickle, so it executes code on load. It is produced by
     this repository's own training run and committed alongside its model card;
     do not point this at a file from anywhere else.
 
     Args:
-        path: Optional override path.
+        path: Optional override path. Wins over ``variant``.
+        variant: Which shipped artefact to load; see :data:`MODEL_VARIANTS`.
+            The default ``"refit"`` model has seen every labelled match, so do
+            not score it on the held-out matches -- use ``variant="split"`` and
+            :func:`score_held_out`, which enforces this.
 
     Returns:
         The fitted :class:`ProxyModel`.
@@ -2281,7 +2486,7 @@ def load_bundled_model(path: Path | None = None) -> ProxyModel:
     Raises:
         FileNotFoundError: If no artefact is present.
     """
-    source = Path(path) if path is not None else bundled_model_path()
+    source = Path(path) if path is not None else bundled_model_path(variant)
     if not source.exists():
         raise FileNotFoundError(
             f"no proxy model at {source}. Train one with "
@@ -2292,6 +2497,117 @@ def load_bundled_model(path: Path | None = None) -> ProxyModel:
     if not isinstance(model, ProxyModel):
         raise TypeError(f"{source} does not contain a ProxyModel, got {type(model).__name__}")
     return model
+
+
+# --------------------------------------------------------------------------- #
+# Honest scoring
+# --------------------------------------------------------------------------- #
+
+
+def training_match_ids(model: ProxyModel) -> tuple[int, ...]:
+    """Match ids the model was fitted on, from its own metadata.
+
+    Args:
+        model: A fitted model.
+
+    Returns:
+        Sorted match ids.
+
+    Raises:
+        KeyError: If the artefact predates the metadata and cannot say.
+    """
+    return _recorded_ids(model, "train_match_ids")
+
+
+def held_out_match_ids(model: ProxyModel) -> tuple[int, ...]:
+    """Match ids held out of the fit that produced the model's metrics.
+
+    Args:
+        model: A fitted model.
+
+    Returns:
+        Sorted match ids.
+
+    Raises:
+        KeyError: If the artefact predates the metadata and cannot say.
+    """
+    return _recorded_ids(model, "held_out_match_ids")
+
+
+def _recorded_ids(model: ProxyModel, key: str) -> tuple[int, ...]:
+    """Read a match-id list out of model metadata.
+
+    Args:
+        model: A fitted model.
+        key: Metadata key.
+
+    Returns:
+        Sorted match ids.
+
+    Raises:
+        KeyError: If the key is absent.
+    """
+    values = dict(model.metadata).get(key)
+    if values is None:
+        raise KeyError(
+            f"this artefact records no {key!r}; it predates the split metadata. "
+            "Retrain with `python -m pressing.proxy` to get an artefact that knows "
+            "which matches it saw."
+        )
+    return tuple(sorted(int(v) for v in values))
+
+
+def score_held_out(
+    model: ProxyModel,
+    features: pd.DataFrame,
+    targets: pd.Series,
+    group_col: str = "match_id",
+) -> ProxyMetrics:
+    """Score a model on the matches it was actually held out of -- or refuse.
+
+    This exists because the obvious thing to do is wrong. The deployable
+    artefact is refitted on every labelled row; feeding it the documented
+    held-out match ids and reading the correlation gives an in-sample number
+    (measured: r = 0.6151 against the honest 0.3692) with nothing to signal
+    that anything went wrong. v0.1.0 warned about that in three places, which
+    is the weakest possible fix. This function makes it raise instead.
+
+    Args:
+        model: A fitted model whose metadata records ``fitted_on`` and
+            ``held_out_match_ids``.
+        features: Any feature frame carrying ``group_col``; it is filtered down
+            to the model's recorded held-out matches, so passing the whole
+            labelled dataset is fine and is the expected use.
+        targets: Labels aligned to ``features``.
+        group_col: Column identifying the match.
+
+    Returns:
+        :class:`ProxyMetrics` over the held-out matches only.
+
+    Raises:
+        KeyError: If the artefact does not record its split.
+        ValueError: If the model was fitted on the rows it is being asked to
+            score, or if none of the held-out matches are present.
+    """
+    fitted_on = dict(model.metadata).get("fitted_on")
+    held_out = held_out_match_ids(model)
+    if fitted_on != "train_matches":
+        raise ValueError(
+            f"this model was fitted on {fitted_on!r}, so its held-out matches are not held out "
+            "of it and scoring it on them is in-sample. Load the split artefact with "
+            "`load_bundled_model(variant='split')`, which is fitted on the training matches "
+            "only, or refit on the training rows yourself."
+        )
+    if len(features) != len(targets):
+        raise ValueError(f"features has {len(features)} rows, targets has {len(targets)}")
+    keep = np.isin(features[group_col].to_numpy(), np.asarray(held_out))
+    if not keep.any():
+        raise ValueError(
+            f"none of the model's {len(held_out)} held-out matches appear in {group_col}"
+        )
+    subset = features[keep]
+    y = pd.Series(np.asarray(targets, dtype=float)).reset_index(drop=True)[keep]
+    return score_predictions(np.asarray(model.predict(subset)), y, subset, group_col)
 
 
 # --------------------------------------------------------------------------- #
@@ -2323,14 +2639,20 @@ def train_from_cache(
     jobs: int | None = None,
     download: bool = False,
     verbose: bool = True,
-) -> tuple[ProxyModel, pd.DataFrame, pd.DataFrame]:
+) -> tuple[ProxyModel, ProxyModel, pd.DataFrame, pd.DataFrame]:
     """Build the dataset, split by match, train, and measure -- in one call.
 
-    The returned model is refitted on EVERY labelled row, because that is the
-    one you would ship; the metrics are from the held-out split and describe a
-    model trained on ``1 - test_fraction`` of the matches. Reporting metrics
-    from the shipped model on its own training data would be meaningless, and
-    shipping only the split model would throw away a third of the data.
+    **Two models come back, and the difference matters.** The refit model is
+    fitted on EVERY labelled row: it is the one you would deploy, and shipping
+    only the split model would throw a third of the data away. But it has seen
+    every match, so its own held-out metrics cannot be reproduced with it --
+    scoring it on the recorded held-out matches is in-sample and returns about
+    r = 0.61 against a true 0.39, with nothing to signal the mistake. The split
+    model is fitted on the training matches only and is the one the metrics
+    table describes. Both carry ``fitted_on``, ``train_match_ids`` and
+    ``held_out_match_ids`` in their metadata, and :func:`score_held_out` refuses
+    to score the refit one, so the confusion is now an exception rather than a
+    warning in a document.
 
     Args:
         cache_dir: StatsBomb cache root.
@@ -2338,12 +2660,13 @@ def train_from_cache(
         target: Label column, ``"recovery_360"`` or ``"recovery_360_visible"``.
         test_fraction: Share of MATCHES held out.
         seed: Split seed.
-        jobs: Worker processes for dataset assembly.
+        jobs: Worker processes for dataset assembly. Does not affect the result:
+            :func:`build_dataset` returns a canonical row order.
         download: Fetch anything not already cached, at one request per second.
         verbose: Print progress and the comparison table.
 
     Returns:
-        ``(model, comparison_table, dataset)``.
+        ``(refit_model, split_model, comparison_table, dataset)``.
 
     Raises:
         ValueError: If no labelled rows survive.
@@ -2362,8 +2685,42 @@ def train_from_cache(
         raise ValueError("no labelled turnovers; is the 360 cache populated?")
 
     train_mask, test_mask = split_by_match(labelled, test_fraction, seed)
-    split_model = train(labelled[train_mask], labelled.loc[train_mask, target],
-                        target_name=target)
+    train_ids = sorted(int(v) for v in labelled.loc[train_mask, "match_id"].unique())
+    test_ids = sorted(int(v) for v in labelled.loc[test_mask, "match_id"].unique())
+    common: dict[str, Any] = {
+        "trained_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "competitions": [
+            f"{c} {s}" for c, s in
+            listing[["competition", "season"]].drop_duplicates().to_numpy().tolist()
+        ],
+        "n_matches": int(labelled["match_id"].nunique()),
+        "n_turnovers": int(len(dataset)),
+        "n_labelled": int(len(labelled)),
+        "target": target,
+        "test_fraction": test_fraction,
+        "seed": seed,
+        "train_match_ids": train_ids,
+        "held_out_match_ids": test_ids,
+        "n_train_rows": int(train_mask.sum()),
+        "n_held_out_rows": int(test_mask.sum()),
+        "label_phase_means": {
+            str(k): float(v)
+            for k, v in labelled.groupby("phase")[target].mean().items()
+        },
+    }
+
+    split_model = train(
+        labelled[train_mask],
+        labelled.loc[train_mask, target],
+        target_name=target,
+        metadata={
+            **common,
+            "fitted_on": "train_matches",
+            "in_sample_warning": (
+                "fitted on train_match_ids only; score_held_out() will score this one."
+            ),
+        },
+    )
     table = compare_models(labelled, labelled[target], train_mask, test_mask, split_model)
     if verbose:
         print(table.round(4).to_string(index=False), flush=True)
@@ -2373,21 +2730,24 @@ def train_from_cache(
         labelled[target],
         target_name=target,
         metadata={
-            "trained_utc": pd.Timestamp.now(tz="UTC").isoformat(),
-            "competitions": [
-                f"{c} {s}" for c, s in
-                listing[["competition", "season"]].drop_duplicates().to_numpy().tolist()
-            ],
-            "n_matches": int(labelled["match_id"].nunique()),
-            "n_turnovers": int(len(dataset)),
-            "n_labelled": int(len(labelled)),
-            "target": target,
-            "test_fraction": test_fraction,
-            "seed": seed,
+            **common,
+            "fitted_on": "all_labelled",
+            "in_sample_warning": (
+                "fitted on EVERY labelled row, including held_out_match_ids. Scoring this "
+                "artefact on those matches is in-sample and will flatter it. Use the "
+                "'split' artefact and score_held_out()."
+            ),
             "held_out_metrics": table.to_dict(orient="records"),
         },
     )
-    return model, table, dataset
+    split_model.metadata["held_out_metrics"] = table.to_dict(orient="records")
+    model.metadata["predicted_phase_means"] = {
+        str(k): float(v)
+        for k, v in pd.Series(model.predict(labelled)).groupby(
+            labelled["phase"].to_numpy()
+        ).mean().items()
+    }
+    return model, split_model, table, dataset
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2406,7 +2766,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Train the event-only counter-press proxy on StatsBomb 360.",
     )
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
-    parser.add_argument("--out", default=None, help="Artefact path.")
+    parser.add_argument("--out", default=None, help="Refit artefact path.")
+    parser.add_argument(
+        "--out-split", default=None,
+        help="Split-model artefact path. This is the model the metrics describe.",
+    )
     parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument("--test-fraction", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=0)
@@ -2418,7 +2782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    model, _, _ = train_from_cache(
+    model, split_model, _, _ = train_from_cache(
         args.cache_dir,
         target=args.target,
         test_fraction=args.test_fraction,
@@ -2426,8 +2790,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         jobs=args.jobs,
         download=args.download,
     )
-    path = save_model(model, args.out)
-    print(f"wrote {path} ({path.stat().st_size / 1e6:.2f} MB)")
+    for fitted, out, variant in (
+        (model, args.out, "refit"),
+        (split_model, args.out_split, "split"),
+    ):
+        path = save_model(fitted, out if out is not None else bundled_model_path(variant))
+        print(f"wrote {path} ({path.stat().st_size} bytes, fitted_on="
+              f"{fitted.metadata['fitted_on']})")
     return 0
 
 

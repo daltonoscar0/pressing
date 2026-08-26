@@ -19,17 +19,27 @@ Two different quantities live in the output table and they must not be confused.
     **Estimates**, from the event-only proxy in :mod:`pressing.proxy`. The proxy
     predicts a control share per turnover; a player is credited with the
     turnovers he actually pressed. Per the model card the proxy composes to
-    ``r ~ 0.18`` against the tracking-derived quantity it stands in for, so
-    these columns are weak signals and are labelled as such in the CSV header.
+    ``r ~ 0.10 to 0.18`` against the tracking-derived quantity it stands in for
+    -- the range, not the flattering end, because the label-quality term it
+    multiplies is itself only known to lie between 0.26 and 0.47. These columns
+    are weak signals and are labelled as such in the CSV header.
 
-**Recovery is dominated by WHERE the ball was lost.** On Metrica game 1 the
-phase means are build-up 0.26, middle 0.47, final third 0.70. A player who
-presses mostly in the final third will show a higher mean recovery than one who
-presses mostly in his own build-up phase, and that difference says more about
-his team's shape than about him. The table therefore carries the per-phase
-counts (``pressed_build_up`` / ``pressed_middle`` / ``pressed_final_third``)
-next to the mean, the CSV header repeats the caveat, and recovery values are
-only comparable within a phase.
+**Recovery is dominated by WHERE the ball was lost.** A player who presses
+mostly in the final third will show a higher mean recovery than one who presses
+mostly in his own build-up phase, and that difference says more about his team's
+shape than about him. The table therefore carries the per-phase counts
+(``pressed_build_up`` / ``pressed_middle`` / ``pressed_final_third``) next to the
+mean, the CSV header repeats the caveat, and recovery values are only comparable
+within a phase.
+
+The reference scale in that header is the **proxy's own**, from
+:func:`pressing.proxy.phase_reference_means` -- build-up 0.465, middle 0.489,
+final third 0.541 for the shipped artefact. Up to v0.1.0 the header printed the
+*tracking* metric's phase means instead (0.26 / 0.47 / 0.70 on Metrica game 1),
+which these numbers do not live on: the proxy's gradient across pitch thirds is
++0.076 against the tracking metric's +0.444, so a proxy build-up value of 0.47 --
+its own average -- read against a stated 0.26 looks like an extraordinary press
+and is not one.
 
 Minutes
 -------
@@ -1507,7 +1517,11 @@ def season_table(
     return joined, spec, stats_out
 
 
-def _csv_header(spec: SeasonSpec, stats: dict[str, Any]) -> list[str]:
+def _csv_header(
+    spec: SeasonSpec,
+    stats: dict[str, Any],
+    model: proxy.ProxyModel | None = None,
+) -> list[str]:
     """Comment lines stamped on top of the season CSV.
 
     Attribution is required on every season output, and the two caveats that
@@ -1515,9 +1529,18 @@ def _csv_header(spec: SeasonSpec, stats: dict[str, Any]) -> list[str]:
     recovery -- travel with the file rather than living only in a README that
     the file will be separated from.
 
+    The phase reference means come from :func:`pressing.proxy.phase_reference_means`,
+    which reports what the *proxy* predicts. Until v0.1.0 this header printed the
+    tracking metric's phase means instead, which are a different scale entirely:
+    the proxy's own gradient across pitch thirds is about +0.08 where the tracking
+    metric's is +0.44, so a reader who scaled a proxy value against the tracking
+    numbers would read the proxy's own average as a remarkable press.
+
     Args:
         spec: The resolved season.
         stats: Counts from :func:`season_table`.
+        model: The proxy model whose estimates the table carries, so the header
+            quotes that model's own phase means rather than a recorded default.
 
     Returns:
         Lines, each already prefixed with ``#``.
@@ -1533,10 +1556,12 @@ def _csv_header(spec: SeasonSpec, stats: dict[str, Any]) -> list[str]:
         "counterpress_actions is StatsBomb's own counterpress flag: a defensive action within "
         "5 seconds of an open-play turnover. It is a count, not a model output.",
         "mean_recovery_pressed and press_value_per_90 are event-proxy ESTIMATES. The proxy "
-        "composes to r ~ 0.18 against the tracking-derived metric (models/MODEL_CARD.md).",
-        "Recovery depends heavily on WHERE the ball was lost (Metrica game 1 phase means: "
-        "build-up 0.26, middle 0.47, final third 0.70). Compare only within a phase; the "
-        "pressed_* columns give each player's phase mix.",
+        "composes to r ~ 0.10 to 0.18 against the tracking-derived metric it stands in for. "
+        "That is a range, not a rounding: the label's own quality is only known to lie between "
+        "r = 0.26 and r = 0.47 (models/MODEL_CARD.md).",
+        *proxy.recovery_phase_caveat(model),
+        "the pressed_* columns give each player's phase mix, which is what makes the "
+        "within-phase comparison possible.",
         "minutes are elapsed clock minutes from the lineup files, including stoppage time, so "
         "a full match reads about 94 rather than 90.",
     ]
@@ -1553,6 +1578,7 @@ def write_season_csv(
     path: Path | str,
     spec: SeasonSpec,
     stats: dict[str, Any],
+    model: proxy.ProxyModel | None = None,
 ) -> Path:
     """Write the season table with its attribution and caveats on top.
 
@@ -1561,6 +1587,9 @@ def write_season_csv(
         path: Destination CSV.
         spec: The resolved season.
         stats: Counts from :func:`season_table`.
+        model: The proxy model behind the estimate columns, so the header can
+            quote that model's own phase means. ``None`` falls back to the means
+            recorded for the shipped artefact.
 
     Returns:
         The path written.
@@ -1569,7 +1598,7 @@ def write_season_csv(
     destination.parent.mkdir(parents=True, exist_ok=True)
     columns = [c for c in SEASON_TABLE_COLUMNS if c in table.columns]
     body = table.reindex(columns=columns).to_csv(index=False)
-    destination.write_text("\n".join(_csv_header(spec, stats)) + "\n" + body)
+    destination.write_text("\n".join(_csv_header(spec, stats, model)) + "\n" + body)
     return destination
 
 
@@ -1674,6 +1703,15 @@ def run_season(
         The :class:`SeasonResult`, including the warnings the caller should
         print.
     """
+    if model is None:
+        # Resolved here as well as inside season_table so that the CSV header can
+        # quote THIS model's own phase means rather than a recorded default. A
+        # failure is not fatal and is reported by season_table exactly as before.
+        try:
+            model = proxy.load_bundled_model()
+        except FileNotFoundError:
+            model = None
+
     table, spec, stats = season_table(
         source,
         competition,
@@ -1689,7 +1727,9 @@ def run_season(
     )
 
     stem = f"{_slug(spec.competition)}_{_slug(spec.season)}"
-    csv_path = write_season_csv(table, Path(out_dir) / f"{stem}_counterpress.csv", spec, stats)
+    csv_path = write_season_csv(
+        table, Path(out_dir) / f"{stem}_counterpress.csv", spec, stats, model
+    )
     png_path, n_plotted = write_scatter(
         table, Path(out_dir) / f"{stem}_counterpress_vs_value.png", spec, stats
     )
