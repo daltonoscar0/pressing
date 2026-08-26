@@ -25,6 +25,38 @@ pairing football graphics reach for by default. The pitch-control diverging map
 is built from those same two colours with a neutral grey midpoint, so a coach
 reads "blue grass is the blue team's grass" without consulting a key.
 
+**One channel, one meaning: hue is always team identity.** This is the rule the
+whole report obeys, and it is a rule because the alternative was caught in
+review -- an earlier loss map spent hue on the recovery share (red to indigo)
+and demoted teams to circle-versus-triangle, so page 2 said "blue means a good
+press" while pages 3-5 said "blue means the home team". Adjacent pages of one
+document may not use the same channel for two different things. So:
+
+* **Hue** = which team. Blue is home on every page, orange is away on every page.
+* **Lightness within a hue** = how much of that team's metric. Pale blue is a
+  home loss the press never recovered from; deep blue is one it owned. See
+  :func:`recovery_cmap`.
+* **A diverging blue-grey-orange ramp** = a contest between the two teams, and
+  is used for exactly one thing, the pitch-control surface, where the two poles
+  really are the two teams. See :func:`control_cmap`.
+* **Marker fill** (solid versus open) = the SIGN of a signed quantity, never its
+  size; **marker area** = its magnitude. Colour is never asked to carry a sign.
+* **Grey** = not measurable. A grey mark is a loss that could not be scored, not
+  a loss that scored badly.
+
+Reading EPV
+-----------
+``epv_conceded`` is a per-cell mean of ``EPV * control`` over the grid, which
+makes it resolution-independent and very small: the measured spread over the 255
+scored losses in Metrica game 1 is -0.0026 to +0.0040, so printed raw every
+caption in the report read ``+0.0001``. Every figure here therefore displays it
+through :func:`format_epv`, which multiplies by :data:`EPV_DISPLAY_SCALE` and
+names the result :data:`EPV_DISPLAY_UNIT`. The scale factor is a unit change and
+nothing else -- no integration over the grid, so numbers stay comparable between
+a 50 x 32 demo surface and a 105 x 68 print surface. Wherever the unit appears
+it is named, and :data:`EPV_UNIT_GLOSS` is the one-line definition a report page
+should print in its method footnote.
+
 Coordinates
 -----------
 Everything here speaks the canonical project frame: metres on a 105 x 68 pitch,
@@ -37,35 +69,57 @@ Getting that backwards flips the heatmap top-for-bottom while leaving a
 completely plausible-looking picture, which is the single easiest silent error
 in this module -- :func:`control_heatmap` is covered by an explicit
 pixel-sampling regression test for it.
+
+Fonts
+-----
+:func:`register_fonts` adds matplotlib's own bundled DejaVu Sans faces to the
+font manager by absolute path before anything is drawn. Player names in this
+data are not ASCII -- "Vukovic", "Gundogan" and "Lukasz" are all spelled with
+characters outside Latin-1 -- and a face without those glyphs renders them as
+empty boxes. matplotlib at least warns; the PDF layer's default face does the
+same substitution with no exception at all, which is why the same faces are
+registered on both sides. DejaVu ships inside matplotlib, so this costs no
+dependency and works on a fresh offline clone.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Final
 
 import matplotlib as mpl
 import numpy as np
 import pandas as pd
 from matplotlib import colors as mcolors
+from matplotlib import font_manager, patheffects
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.cm import ScalarMappable
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.patches import Arc, Ellipse, Rectangle
+from matplotlib.patches import Arc, Ellipse, Patch, Rectangle
+from matplotlib.path import Path as MarkerPath
 
 from pressing.pitchcontrol import players_from_tracking
 from pressing.schema import PITCH_LENGTH, PITCH_WIDTH
 
 __all__ = [
     "AWAY_COLOUR",
+    "BALL_STATES",
     "CENTRE_CIRCLE_R",
     "CORNER_R",
+    "EPV_DISPLAY_SCALE",
+    "EPV_DISPLAY_UNIT",
+    "EPV_UNIT_GLOSS",
+    "FONT_FILES",
     "GOAL_DEPTH",
     "GOAL_WIDTH",
     "HOME_COLOUR",
     "INK",
+    "MIN_PHASE_LOSSES",
     "PENALTY_AREA_DEPTH",
     "PENALTY_AREA_WIDTH",
     "PENALTY_ARC_R",
@@ -79,7 +133,9 @@ __all__ = [
     "ball_from_tracking",
     "control_cmap",
     "control_heatmap",
+    "direction_note_text",
     "draw_pitch",
+    "format_epv",
     "lock_pitch_aspect",
     "loss_map",
     "moment_caption",
@@ -91,7 +147,10 @@ __all__ = [
     "positions_from_tracking",
     "recovery_cmap",
     "recovery_sparkline",
+    "register_fonts",
+    "resolve_ball",
     "season_scatter",
+    "strip_figsize",
     "styled",
     "team_colour",
     "team_label",
@@ -135,14 +194,37 @@ TEAM_COLOURS: Final[dict[str, str]] = {"home": HOME_COLOUR, "away": AWAY_COLOUR}
 #: diverging scale has to read as "nothing to see here".
 NEUTRAL_MID: Final[str] = "#f0efec"
 
-#: Poles of the recovery ramp. Deliberately NOT the team colours: on the loss
-#: map colour already means "how much did we win back", so team identity is
-#: carried by marker shape instead and the two encodings never collide.
-RECOVERY_LOW: Final[str] = "#c1352f"
-RECOVERY_HIGH: Final[str] = "#3d3f8f"
-
 #: Accent used for a single highlighted mark (season-scatter outliers).
 ACCENT: Final[str] = "#eb6834"
+
+#: Multiplier applied to ``epv_conceded`` before it is printed, and the name of
+#: the resulting unit. See the module docstring: the raw quantity is a per-cell
+#: mean in the range -0.0026 to +0.0040 over Metrica game 1, so every caption
+#: printed the same "+0.0001". This is a unit change only -- no integration over
+#: the grid -- so a number stays comparable across grid resolutions.
+EPV_DISPLAY_SCALE: Final[float] = 1000.0
+EPV_DISPLAY_UNIT: Final[str] = "mEPV"
+
+#: One-line definition of :data:`EPV_DISPLAY_UNIT`, for a report's method note.
+EPV_UNIT_GLOSS: Final[str] = (
+    "mEPV: expected possession value the opponent gained over the 5 s window, "
+    "averaged per grid cell and multiplied by 1000. Positive means they made "
+    "ground; negative means the press pushed them backwards."
+)
+
+#: A phase bar resting on fewer scored losses than this is drawn faded and
+#: flagged, because the difference between two such bars is noise. Metrica game
+#: 1 puts 11 (home) and 13 (away) of its 255 scored losses in build-up, against
+#: 53-61 in each of the other two phases, which is the case this exists for.
+MIN_PHASE_LOSSES: Final[int] = 20
+
+#: How the ball can be known at an instant. ``"tracked"`` is a real tracking
+#: row; ``"inferred"`` is the last known position held forward, matching
+#: :class:`pressing.counterpress.CounterPressParams` ``ball_policy="hold"``;
+#: ``"unknown"`` is neither, and is DISCLOSED on the panel rather than passed
+#: over in silence. The Metrica ball has no tracking row in 39.1% of game 1's
+#: frames and at 14.97% of the six timepoints across its 256 losses.
+BALL_STATES: Final[tuple[str, ...]] = ("tracked", "inferred", "unknown")
 
 #: Mixed toward this to make the deep end of a diverging ramp.
 _DEEP: Final[str] = "#0d1114"
@@ -150,6 +232,14 @@ _DEEP: Final[str] = "#0d1114"
 #: Type scale. DejaVu Sans ships with matplotlib, so it is present offline on a
 #: fresh clone and it is the same face the PDF registers for player names.
 FONT_STACK: Final[list[str]] = ["DejaVu Sans"]
+
+#: Faces :func:`register_fonts` adds from matplotlib's own ``mpl-data``.
+FONT_FILES: Final[tuple[str, ...]] = (
+    "DejaVuSans.ttf",
+    "DejaVuSans-Bold.ttf",
+    "DejaVuSans-Oblique.ttf",
+)
+
 FONT_SIZE: Final[float] = 8.5
 TITLE_SIZE: Final[float] = 10.5
 LABEL_SIZE: Final[float] = 8.0
@@ -165,6 +255,10 @@ SERIES_LW: Final[float] = 1.8
 #: Marker sizes, in points.
 PLAYER_MS: Final[float] = 8.0
 BALL_MS: Final[float] = 5.5
+
+#: Title pad, in points, on a panel that also carries a key above the axes.
+#: The key is right-aligned in this band and the title left-aligned above it.
+_TITLE_PAD_WITH_KEY: Final[float] = 17.0
 
 #: Default render resolution. 150 dpi is the measured sweet spot for the PDF:
 #: visually clean at A4 and half the file size of 200 dpi for no print gain.
@@ -213,13 +307,43 @@ RC: Final[dict[str, Any]] = {
 }
 
 
+@lru_cache(maxsize=1)
+def register_fonts() -> tuple[str, ...]:
+    """Register matplotlib's bundled DejaVu Sans faces by absolute path.
+
+    Player names in this data are not ASCII. A face missing the glyph for
+    ``c``-acute, ``g``-breve or a slashed ``L`` draws an empty box instead, and
+    on some backends the only sign is a warning nobody reads. DejaVu Sans has
+    all of them and ships inside matplotlib, so registering it explicitly costs
+    no dependency and works offline on a fresh clone. Registering by path
+    rather than trusting the font cache also survives a cold or stale
+    ``MPLCONFIGDIR``, where the cache may not yet list any face at all.
+
+    Cached: the work happens once per process.
+
+    Returns:
+        The absolute paths that were registered, in :data:`FONT_FILES` order.
+        Empty if matplotlib's data directory is not where it says it is.
+    """
+    root = Path(mpl.get_data_path()) / "fonts" / "ttf"
+    added: list[str] = []
+    for name in FONT_FILES:
+        path = root / name
+        if path.is_file():
+            font_manager.fontManager.addfont(str(path))
+            added.append(str(path))
+    return tuple(added)
+
+
 @contextmanager
 def styled(overrides: dict[str, Any] | None = None) -> Iterator[None]:
     """Apply the project rc settings for the duration of the block.
 
     Every renderer in this module wraps itself in this, so figures built here
     look identical whatever the caller's rcParams are, and the caller's
-    rcParams are restored on the way out.
+    rcParams are restored on the way out. The DejaVu faces are registered on
+    the way in, so no figure can be drawn with a face that lacks the glyphs
+    real player names need.
 
     Args:
         overrides: Extra rc entries applied on top of :data:`RC`.
@@ -227,6 +351,7 @@ def styled(overrides: dict[str, Any] | None = None) -> Iterator[None]:
     Yields:
         None.
     """
+    register_fonts()
     settings = dict(RC)
     if overrides:
         settings.update(overrides)
@@ -334,27 +459,60 @@ def control_cmap(
     )
 
 
-def recovery_cmap() -> mcolors.LinearSegmentedColormap:
-    """Diverging colormap for the 5 s recovery share.
+def recovery_cmap(team: str = "home") -> mcolors.LinearSegmentedColormap:
+    """Sequential ramp for the 5 s recovery share, inside one team's hue.
 
-    Centred on 0.5, which the metric defines as a dead-even standoff: below it
-    the opponent walked away from the press, above it the press owned the
-    ground that mattered.
+    Pale is a loss the press never recovered from, deep is one it owned. The
+    hue is the team's own, because hue means team on every page of the report
+    and may not be borrowed to mean a quantity on one of them -- see the module
+    docstring. Lightness is the free channel, so lightness carries the number.
+
+    Args:
+        team: ``"home"`` or ``"away"``; whose hue the ramp is built in.
 
     Returns:
-        A 256-step diverging colormap.
+        A 256-step sequential colormap running from near-paper to a deep
+        version of the team colour.
     """
+    colour = team_colour(team)
     return mcolors.LinearSegmentedColormap.from_list(
-        "pressing_recovery",
+        f"pressing_recovery_{team}",
         [
-            _mix(RECOVERY_LOW, _DEEP, 0.35),
-            RECOVERY_LOW,
-            NEUTRAL_MID,
-            RECOVERY_HIGH,
-            _mix(RECOVERY_HIGH, _DEEP, 0.35),
+            # The pale end stops short of the paper. A ramp that reaches white
+            # puts its lowest values below the pitch fill, and a loss the press
+            # never recovered from is the last thing that should disappear.
+            _mix(colour, SURFACE, 0.76),
+            _mix(colour, SURFACE, 0.46),
+            colour,
+            _mix(colour, _DEEP, 0.45),
         ],
         N=256,
     )
+
+
+def format_epv(value: Any, *, digits: int = 2, unit: bool = True) -> str:
+    """Format an ``epv_conceded`` value the way every figure prints it.
+
+    Args:
+        value: Raw ``epv_conceded``, the per-cell mean the metric returns.
+        digits: Decimal places after scaling.
+        unit: Whether to append :data:`EPV_DISPLAY_UNIT`.
+
+    Returns:
+        A signed string such as ``"+0.66 mEPV"``, or ``""`` when the value is
+        missing or non-finite. Never prints the raw number: at four decimal
+        places every real loss in game 1 reads ``+0.0001``.
+    """
+    if value is None:
+        return ""
+    try:
+        scaled = float(value) * EPV_DISPLAY_SCALE
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(scaled):
+        return ""
+    text = f"{scaled:+.{digits}f}"
+    return f"{text} {EPV_DISPLAY_UNIT}" if unit else text
 
 
 # --------------------------------------------------------------------------- #
@@ -707,8 +865,11 @@ def _draw_players(
         markerfacecolor=_mix(colour, _DEEP, 0.32),
         markeredgecolor=SURFACE,
         # The ring separates overlapping markers, so it has to scale with the
-        # marker: a fixed 1.1 pt ring eats a 4 pt thumbnail marker alive.
-        markeredgewidth=max(0.45, size * 0.14),
+        # marker: a fixed 1.1 pt ring eats a 4 pt thumbnail marker alive. It is
+        # also kept thin, because paper-coloured ring is the brightest thing on
+        # a saturated control surface and a fat one turns every player into a
+        # white dot at reading distance.
+        markeredgewidth=max(0.4, size * 0.10),
         label=label,
         zorder=zorder,
     )
@@ -727,18 +888,88 @@ def _draw_players(
             )
 
 
-def _draw_ball(ax: Axes, ball: Any, *, size: float = BALL_MS, zorder: float = 6.0) -> None:
-    """Draw the ball, if it is known at this instant.
+def resolve_ball(
+    ball: Any,
+    last_known: Any = None,
+) -> tuple[np.ndarray | None, str]:
+    """Decide what to draw for the ball at one instant.
+
+    The Metrica ball has no tracking row in 39.1% of game 1's frames, so a
+    panel that only ever draws a tracked ball draws no ball at all on a large
+    minority of moments. :func:`pressing.counterpress.score_losses` already
+    holds the last known position forward for the metric under its documented
+    ``ball_policy="hold"``; this is the same fallback for the picture, and it
+    reports which of the two it used so the panel can say so.
+
+    Args:
+        ball: ``(2,)`` tracked ball position in canonical metres, or None.
+        last_known: ``(2,)`` last position the ball was actually tracked at,
+            held forward. Optional.
+
+    Returns:
+        ``(position, state)`` where ``state`` is one of :data:`BALL_STATES`.
+        ``position`` is None only when ``state`` is ``"unknown"``.
+    """
+    tracked = _as_xy(ball)
+    if len(tracked) and np.isfinite(tracked[0]).all():
+        return tracked[0], "tracked"
+    held = _as_xy(last_known)
+    if len(held) and np.isfinite(held[0]).all():
+        return held[0], "inferred"
+    return None, "unknown"
+
+
+def _draw_ball(
+    ax: Axes,
+    ball: Any,
+    *,
+    state: str = "tracked",
+    size: float = BALL_MS,
+    zorder: float = 6.0,
+) -> str:
+    """Draw the ball, marking an inferred position as inferred.
+
+    A tracked ball is a solid white disc with a hard ink rim. An inferred one
+    is a hollow ring of the same size inside a wide, faint halo -- "somewhere
+    about here", which is exactly what a held position means. Both marks are
+    specified entirely in points, so they keep their proportions from a
+    full-width hero panel down to a thumbnail, and both survive greyscale: the
+    difference is fill and halo, not colour.
 
     Args:
         ax: Axes to draw on.
         ball: ``(2,)`` ball position in canonical metres, or None.
+        state: One of :data:`BALL_STATES`. ``"unknown"`` draws nothing.
         size: Marker size in points.
         zorder: Draw order.
+
+    Returns:
+        The state actually drawn -- ``"unknown"`` when the position was missing
+        or non-finite, whatever was asked for.
     """
     xy = _as_xy(ball)
-    if len(xy) == 0 or not np.isfinite(xy[0]).all():
-        return
+    if state == "unknown" or len(xy) == 0 or not np.isfinite(xy[0]).all():
+        return "unknown"
+    # Every ball mark carries a paper-coloured outline. At t0 the ball sits
+    # exactly on the turnover cross by construction -- the loss location IS the
+    # tracked ball -- so an ink mark with no outline vanishes into an ink cross.
+    halo = [patheffects.withStroke(linewidth=2.6, foreground=SURFACE)]
+    if state == "inferred":
+        ax.plot(
+            xy[0, 0],
+            xy[0, 1],
+            linestyle="none",
+            marker="o",
+            # Bigger than a tracked ball and open: the mark says "somewhere
+            # about here", which is exactly what a held position is worth.
+            markersize=size * 1.5,
+            markerfacecolor="none",
+            markeredgecolor=INK,
+            markeredgewidth=1.2,
+            zorder=zorder,
+            path_effects=halo,
+        )
+        return "inferred"
     ax.plot(
         xy[0, 0],
         xy[0, 1],
@@ -749,16 +980,105 @@ def _draw_ball(ax: Axes, ball: Any, *, size: float = BALL_MS, zorder: float = 6.
         markeredgecolor=INK,
         markeredgewidth=max(0.6, size * 0.24),
         zorder=zorder,
+        path_effects=halo,
     )
+    return "tracked"
 
 
-def _direction_note(ax: Axes, text: str, *, length: float) -> None:
+def _crosshair_marker(gap: float = 0.55) -> MarkerPath:
+    """A four-armed diagonal crosshair marker with an open centre.
+
+    Args:
+        gap: Inner radius of the arms, as a fraction of the marker radius.
+            Everything inside it is left empty for the ball to sit in.
+
+    Returns:
+        A unit-scaled marker path.
+    """
+    r = float(np.sqrt(0.5))
+    verts: list[tuple[float, float]] = []
+    codes: list[int] = []
+    for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
+        verts += [(sx * r * gap, sy * r * gap), (sx * r, sy * r)]
+        codes += [MarkerPath.MOVETO, MarkerPath.LINETO]
+    return MarkerPath(verts, codes)
+
+
+#: The turnover crosshair, sized so a ball marker fits inside its open centre.
+TURNOVER_MARKER: Final[MarkerPath] = _crosshair_marker()
+
+
+def _draw_turnover(ax: Axes, loss_xy: Any, *, size: float = 16.0, zorder: float = 5.6) -> bool:
+    """Mark where the ball was lost.
+
+    This is the one thing a counter-press panel may never be missing. It is an
+    open crosshair, for two reasons. It cannot be mistaken for a ball or a
+    player, which a filled dot or a ring could be. And its centre is empty, so
+    at ``t0`` -- where the loss location IS the tracked ball, by construction
+    -- the ball sits inside it and both marks stay readable, instead of the
+    solid cross swallowing the very mark it accompanies.
+
+    Args:
+        ax: Axes to draw on.
+        loss_xy: ``(2,)`` loss location in canonical metres, or None.
+        size: Marker size in points, measured across the arms.
+        zorder: Draw order. Below the ball's, deliberately.
+
+    Returns:
+        Whether anything was drawn.
+    """
+    xy = _as_xy(loss_xy)
+    if len(xy) == 0 or not np.isfinite(xy[0]).all():
+        return False
+    ax.plot(
+        xy[0, 0],
+        xy[0, 1],
+        linestyle="none",
+        marker=TURNOVER_MARKER,
+        markersize=size,
+        markerfacecolor="none",
+        markeredgecolor=INK,
+        markeredgewidth=1.3,
+        zorder=zorder,
+        path_effects=[patheffects.withStroke(linewidth=2.9, foreground=SURFACE)],
+    )
+    return True
+
+
+def direction_note_text(
+    team_labels: dict[str, str] | None = None, *, compact: bool = False
+) -> str:
+    """The attacking-direction line every pitch figure carries.
+
+    The match is rotated to a single playing direction, so home attacks ``+x``
+    for the whole match and this string is the same on every panel. It is on
+    every panel anyway: a control surface without it says "somebody dominates
+    the right-hand box" and nothing more, which is not information.
+
+    Args:
+        team_labels: Optional real team names keyed by ``"home"`` / ``"away"``.
+        compact: Drop the repeated word "attacking", for a thumbnail where the
+            note has one pitch width to live in rather than a whole panel.
+
+    Returns:
+        A line of the form ``"<- Away attacking   |   Home attacking ->"``.
+    """
+    away, home = team_label("away", team_labels), team_label("home", team_labels)
+    if compact:
+        return f"← {away}   |   {home} →"
+    return f"← {away} attacking    |    {home} attacking →"
+
+
+def _direction_note(
+    ax: Axes, text: str, *, length: float, size: float = CAPTION_SIZE - 0.5
+) -> None:
     """Put a small attacking-direction note under the pitch.
 
     Args:
         ax: Pitch axes.
         text: The note, e.g. ``"Home attacking"``.
         length: Pitch length in metres, used to place the note.
+        size: Font size in points.
     """
     ax.annotate(
         text,
@@ -766,7 +1086,7 @@ def _direction_note(ax: Axes, text: str, *, length: float) -> None:
         xycoords="data",
         ha="center",
         va="top",
-        fontsize=CAPTION_SIZE - 0.5,
+        fontsize=size,
         color=INK_MUTED,
     )
 
@@ -863,7 +1183,13 @@ def _draw_control(
         cmap=control_cmap(attacking_team),
         norm=mcolors.TwoSlopeNorm(vcenter=centre, vmin=vmin, vmax=vmax),
         interpolation=interpolation,
-        alpha=0.9,
+        # Pitch control is close to bimodal -- most of a real surface sits at
+        # one pole or the other -- so at full opacity the panel is a slab of
+        # saturated colour and the player markers, whose white rings are the
+        # only bright thing on it, read as white dots. Letting the paper come
+        # through pulls the whole surface back a step and puts the markers,
+        # the ball and the markings in front of it where they belong.
+        alpha=0.78,
         zorder=1.0,
         aspect="auto",
     )
@@ -872,7 +1198,7 @@ def _draw_control(
 def _control_colorbar(
     fig: Figure,
     image: mpl.image.AxesImage,
-    ax: Axes,
+    ax: Axes | list[Axes],
     *,
     attacking_team: str,
     team_labels: dict[str, str] | None,
@@ -883,7 +1209,7 @@ def _control_colorbar(
     Args:
         fig: Figure to attach to.
         image: The surface image.
-        ax: Axes the bar sits beside.
+        ax: Axes the bar sits beside, or every axes it should span.
         attacking_team: Team whose control the surface measures.
         team_labels: Optional real team names.
         centre: The neutral value.
@@ -898,7 +1224,9 @@ def _control_colorbar(
     bar.outline.set_visible(False)
 
 
-def _horizontal_bar(fig: Figure, mappable: Any, ax: Axes, shrink: float = 0.55) -> Any:
+def _horizontal_bar(
+    fig: Figure, mappable: Any, ax: Axes | list[Axes], shrink: float = 0.55
+) -> Any:
     """Add the house-style colourbar: horizontal, short, under the pitch.
 
     Vertical is the matplotlib default and the wrong choice here. A pitch axes
@@ -929,10 +1257,90 @@ def _horizontal_bar(fig: Figure, mappable: Any, ax: Axes, shrink: float = 0.55) 
     )
 
 
+def _moment_key(
+    ax: Axes,
+    *,
+    ball_state: str,
+    turnover: bool,
+) -> None:
+    """Draw the small ball / turnover key above a moment panel.
+
+    Only the marks actually present are listed, and the "ball untracked" state
+    is listed too. That is the point of it: the ball is missing at 14.97% of
+    the sampled timepoints in game 1, and a panel that just leaves it out is
+    indistinguishable from a panel where nothing happened.
+
+    Args:
+        ax: Pitch axes.
+        ball_state: One of :data:`BALL_STATES`.
+        turnover: Whether a turnover cross was drawn.
+    """
+    handles: list[Line2D] = []
+    if turnover:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker=TURNOVER_MARKER,
+                markerfacecolor="none",
+                markeredgecolor=INK,
+                markeredgewidth=1.2,
+                markersize=9.0,
+                label="ball lost here",
+            )
+        )
+    if ball_state == "tracked":
+        handles.append(
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="o",
+                markerfacecolor=SURFACE,
+                markeredgecolor=INK,
+                markeredgewidth=1.2,
+                markersize=6.0,
+                label="ball",
+            )
+        )
+    elif ball_state == "inferred":
+        handles.append(
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker="o",
+                markerfacecolor="none",
+                markeredgecolor=INK,
+                markeredgewidth=1.0,
+                markersize=8.0,
+                label="ball (last known)",
+            )
+        )
+    else:
+        handles.append(
+            Line2D([], [], linestyle="none", marker="", label="ball untracked here")
+        )
+    if not handles:
+        return
+    ax.legend(
+        handles=handles,
+        loc="lower right",
+        bbox_to_anchor=(1.0, 1.0),
+        ncols=len(handles),
+        borderaxespad=0.0,
+        handletextpad=0.4,
+        columnspacing=1.2,
+    )
+
+
 def control_heatmap(
     control: np.ndarray,
     *,
     ball: Any = None,
+    ball_last_known: Any = None,
+    loss_xy: Any = None,
     attackers: Any = None,
     defenders: Any = None,
     attacking_team: str = "home",
@@ -943,6 +1351,8 @@ def control_heatmap(
     title: str = "",
     caption: str | None = None,
     colorbar: bool = True,
+    key: bool = True,
+    direction: bool = True,
     team_labels: dict[str, str] | None = None,
     figsize: tuple[float, float] = (7.6, 5.0),
     dpi: int = DEFAULT_DPI,
@@ -962,11 +1372,21 @@ def control_heatmap(
     the pitch extent, which is exactly right for the cell-centred grids
     :func:`pressing.pitchcontrol.make_grid` produces.
 
+    Two annotations are not optional in practice and default to on. The
+    attacking-direction note, because a control surface is meaningless without
+    knowing which goal each team is running at. And the ball state: a tracked
+    ball is solid, a held one is a dashed ring, an untracked one is named in
+    the key rather than silently omitted, and the turnover location is marked
+    whenever it is supplied.
+
     Args:
         control: ``(n_y, n_x)`` control probability for ``attacking_team``,
             **row 0 at the bottom touchline** (the orientation
             :func:`pressing.pitchcontrol.pitch_control` returns).
-        ball: ``(2,)`` ball position in canonical metres, or None.
+        ball: ``(2,)`` tracked ball position in canonical metres, or None.
+        ball_last_known: ``(2,)`` last position the ball was tracked at, used
+            when ``ball`` is missing and drawn as an inferred ring.
+        loss_xy: ``(2,)`` location the possession was lost at. Always marked.
         attackers: ``(n, 2)`` positions of the team in possession.
         defenders: ``(n, 2)`` positions of the other team.
         attacking_team: ``"home"`` or ``"away"``; the team the surface measures.
@@ -977,6 +1397,8 @@ def control_heatmap(
         title: Panel title.
         caption: Optional caption line beneath the panel.
         colorbar: Whether to draw the colourbar.
+        key: Whether to draw the ball / turnover key above the pitch.
+        direction: Whether to draw the attacking-direction note.
         team_labels: Optional real team names keyed by ``"home"`` / ``"away"``.
         figsize: Figure size in inches. Ignored when ``ax`` is given.
         dpi: Render resolution. Ignored when ``ax`` is given.
@@ -1043,10 +1465,19 @@ def control_heatmap(
             velocities=attacker_velocities,
             label=team_label(attacking_team, team_labels),
         )
-        _draw_ball(ax, ball)
+        position, state = resolve_ball(ball, ball_last_known)
+        state = _draw_ball(ax, position, state=state)
+        turnover = _draw_turnover(ax, loss_xy)
 
         if title:
-            ax.set_title(title)
+            # The key sits in the title's pad, on its own row: a left-aligned
+            # title and a right-aligned key on the SAME row collide as soon as
+            # either grows, and both of them grow with the team names.
+            ax.set_title(title, pad=_TITLE_PAD_WITH_KEY if key else None)
+        if key:
+            _moment_key(ax, ball_state=state, turnover=turnover)
+        if direction:
+            _direction_note(ax, direction_note_text(team_labels), length=length)
         if colorbar:
             _control_colorbar(
                 fig,
@@ -1082,6 +1513,38 @@ def _mirror(xy: np.ndarray, length: float, width: float) -> np.ndarray:
     return out
 
 
+def _size_from_magnitude(
+    magnitude: np.ndarray,
+    *,
+    floor: float = 16.0,
+    ceiling: float = 130.0,
+    reference: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Map an unsigned magnitude to marker area, on a robust scale.
+
+    The top of the scale is the 95th percentile rather than the maximum, so one
+    freak loss cannot shrink every other mark on the map to a dot; anything
+    above it clips to the ceiling.
+
+    Args:
+        magnitude: Non-negative values, possibly with NaNs.
+        floor: Area of a zero-magnitude mark, in points squared.
+        ceiling: Area at and above the reference.
+        reference: Value that maps to ``ceiling``. Defaults to the 95th
+            percentile of the finite magnitudes.
+
+    Returns:
+        ``(areas, reference)``. ``reference`` is 0.0 when nothing was finite.
+    """
+    finite = np.isfinite(magnitude)
+    if reference is None:
+        reference = float(np.percentile(magnitude[finite], 95.0)) if finite.any() else 0.0
+    if not (reference > 0):
+        return np.full(magnitude.shape, floor), float(reference)
+    fraction = np.clip(np.nan_to_num(magnitude) / reference, 0.0, 1.0)
+    return floor + (ceiling - floor) * fraction, float(reference)
+
+
 def loss_map(
     losses: pd.DataFrame,
     team: str | None = None,
@@ -1100,26 +1563,39 @@ def loss_map(
     width: float = PITCH_WIDTH,
     ax: Axes | None = None,
 ) -> Figure:
-    """Plot every possession loss, coloured by 5 s recovery.
+    """Plot every possession loss, in each team's own colour.
 
-    Colour is the recovery share on a diverging ramp centred at 0.5, the value
-    the metric defines as a dead-even standoff. Marker area is the EPV the
-    opponent gained, so the losses that actually cost something are the ones
-    that draw the eye. Losses that could not be scored are still drawn -- as
-    small hollow grey rings -- because silently dropping them would flatter the
-    map.
+    Four channels, each meaning exactly one thing, and all four obey the rule
+    the rest of the report obeys (see the module docstring):
+
+    * **Position** -- where the ball was lost.
+    * **Hue** -- which team lost it. Blue is home here and on every other page.
+    * **Lightness** -- the 5 s recovery share, pale for a press that was walked
+      away from, deep for one that owned the ground. An earlier version of this
+      figure spent hue on recovery and pushed team identity down to
+      circle-versus-triangle, which made page 2 contradict pages 3-5.
+    * **Marker area and fill** -- how much ground changed hands, and which way.
+      ``epv_conceded`` is signed: positive is the opponent making ground,
+      negative is the press pushing them backwards. Area carries the size of
+      the swing and fill carries its direction, because area alone cannot
+      express a sign and drew a good press exactly as loudly as a bad one.
+
+    Losses that could not be scored are still drawn -- as small grey crosses --
+    because silently dropping them would flatter the map.
 
     Args:
         losses: Scored losses from :func:`pressing.counterpress.score_losses`.
             Needs ``x``, ``y``, ``losing_team`` and ``value``; ``scored`` and
             ``size_by`` are used when present.
         team: Restrict to one losing team, or None for both.
-        value: Column mapped to colour.
-        size_by: Column mapped to marker area, or None for a constant size.
+        value: Column mapped to lightness.
+        size_by: Signed column mapped to marker area and fill. None draws every
+            loss at one size with no fill key, since there is then no sign and
+            no magnitude to carry.
         team_labels: Optional real team names.
         title: Panel title. Defaults to a generated one.
-        caption: Caption line. Defaults to a generated loss count.
-        colorbar: Whether to draw the colourbar.
+        caption: Caption line. Defaults to a generated plain-English key.
+        colorbar: Whether to draw a recovery ramp per team shown.
         show_thirds: Whether to mark the build-up / middle / final-third cuts.
         orient_for_team: When one team is selected, mirror the pitch so that
             team attacks ``+x`` -- a coach reads their own attack left to right.
@@ -1155,8 +1631,13 @@ def loss_map(
                     zorder=2.0,
                 )
 
-        image = None
+        norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+        handles: list[Line2D] = []
+        drawn_teams: list[str] = []
         n_scored = 0
+        reference = 0.0
+        any_gained = False
+        any_pushed = False
         if not table.empty:
             xy = table.loc[:, ["x", "y"]].to_numpy(dtype=float)
             flip = (
@@ -1175,65 +1656,82 @@ def loss_map(
                 good &= table["scored"].fillna(False).to_numpy(dtype=bool)
             n_scored = int(good.sum())
 
-            sizes = np.full(len(table), 34.0)
-            if size_by is not None and size_by in table.columns:
-                magnitude = np.abs(
-                    pd.to_numeric(table[size_by], errors="coerce").to_numpy(dtype=float)
-                )
-                top = float(np.nanmax(magnitude)) if np.isfinite(magnitude).any() else 0.0
-                if top > 0:
-                    sizes = 14.0 + 96.0 * np.nan_to_num(magnitude) / top
+            swing = np.zeros(len(table))
+            signed = size_by is not None and size_by in table.columns
+            if signed:
+                swing = pd.to_numeric(table[size_by], errors="coerce").to_numpy(dtype=float)
+            sizes, reference = _size_from_magnitude(np.abs(swing))
+            # Sign lives in the fill, never in the area: a press that pushed the
+            # opponent backwards is drawn open, one that let them make ground is
+            # drawn solid, and both are sized by how much moved.
+            gained = np.nan_to_num(swing) >= 0.0
 
-            markers = {"home": "o", "away": "^"}
-            teams_present = (
-                [str(team)] if team is not None else ordered_teams(table["losing_team"])
-            )
-            for side in teams_present:
-                pick = good & (table["losing_team"].to_numpy() == side)
-                if not pick.any():
+            sides = [str(team)] if team is not None else ordered_teams(table["losing_team"])
+            for side in sides:
+                on_side = table["losing_team"].to_numpy() == side
+                ramp = recovery_cmap(side)
+                fills = good & on_side & gained
+                opens = good & on_side & ~gained
+                if not (fills.any() or opens.any()):
                     continue
-                image = ax.scatter(
-                    xy[pick, 0],
-                    xy[pick, 1],
-                    c=colour_values[pick],
-                    s=sizes[pick],
-                    marker=markers.get(side, "o"),
-                    cmap=recovery_cmap(),
-                    norm=mcolors.TwoSlopeNorm(vcenter=0.5, vmin=0.0, vmax=1.0),
-                    edgecolors=SURFACE,
-                    linewidths=0.6,
-                    zorder=5.0,
-                )
+                drawn_teams.append(side)
+                if fills.any():
+                    any_gained = True
+                    ax.scatter(
+                        xy[fills, 0],
+                        xy[fills, 1],
+                        c=colour_values[fills],
+                        s=sizes[fills],
+                        marker="o",
+                        cmap=ramp,
+                        norm=norm,
+                        edgecolors=_mix(team_colour(side), _DEEP, 0.45),
+                        linewidths=0.5,
+                        zorder=5.0,
+                    )
+                if opens.any():
+                    any_pushed = True
+                    ax.scatter(
+                        xy[opens, 0],
+                        xy[opens, 1],
+                        s=sizes[opens],
+                        marker="o",
+                        facecolors="none",
+                        # An open ring has no fill to carry the ramp, so the
+                        # ramp goes on its edge and the lightness still reads.
+                        edgecolors=ramp(norm(colour_values[opens])),
+                        linewidths=1.2,
+                        zorder=5.0,
+                    )
             missed = ~good & np.isfinite(xy).all(axis=1)
             if missed.any():
                 ax.scatter(
                     xy[missed, 0],
                     xy[missed, 1],
-                    s=18.0,
-                    facecolors="none",
-                    edgecolors=INK_MUTED,
-                    linewidths=0.7,
+                    s=20.0,
+                    marker="x",
+                    color=INK_MUTED,
+                    linewidths=0.9,
                     zorder=4.0,
                 )
-            # Proxy handles in neutral grey: on this figure colour already means
-            # recovery, so a legend swatch taking its colour from the data would
-            # claim a second, false meaning. Shape is the key, not colour.
-            handles = []
-            if team is None and len(teams_present) > 1:
-                handles += [
+
+            # The legend keys the fill states only. Hue is keyed by the
+            # colourbars, which carry the team names, so a swatch here would be
+            # a second, weaker claim about the same channel.
+            if any_gained and signed:
+                handles.append(
                     Line2D(
                         [],
                         [],
                         linestyle="none",
-                        marker=markers.get(side, "o"),
-                        markerfacecolor=INK_MUTED,
-                        markeredgecolor=SURFACE,
+                        marker="o",
+                        markerfacecolor=INK_SOFT,
+                        markeredgecolor=_mix(INK_SOFT, _DEEP, 0.45),
                         markersize=6.0,
-                        label=team_label(side, team_labels),
+                        label="opponent made ground",
                     )
-                    for side in teams_present
-                ]
-            if missed.any():
+                )
+            if any_pushed and signed:
                 handles.append(
                     Line2D(
                         [],
@@ -1241,7 +1739,20 @@ def loss_map(
                         linestyle="none",
                         marker="o",
                         markerfacecolor="none",
-                        markeredgecolor=INK_MUTED,
+                        markeredgecolor=INK_SOFT,
+                        markeredgewidth=1.2,
+                        markersize=6.0,
+                        label="press pushed them back",
+                    )
+                )
+            if missed.any():
+                handles.append(
+                    Line2D(
+                        [],
+                        [],
+                        linestyle="none",
+                        marker="x",
+                        color=INK_MUTED,
                         markersize=5.0,
                         label="not scored",
                     )
@@ -1252,37 +1763,61 @@ def loss_map(
                     loc="lower right",
                     bbox_to_anchor=(1.0, 1.0),
                     ncols=len(handles),
+                    borderaxespad=0.0,
+                    handletextpad=0.4,
+                    columnspacing=1.2,
                 )
 
         if title is None:
             who = "both teams" if team is None else team_label(team, team_labels)
-            # Short on purpose: the colourbar already says what colour means, and
-            # the legend shares this row.
+            # Short on purpose: the colourbars already say what colour means.
             title = f"Possession losses — {who}"
-        ax.set_title(title)
+        # The legend lives in this pad, right-aligned, one row below the title.
+        ax.set_title(title, pad=_TITLE_PAD_WITH_KEY if handles else None)
 
         if team is not None and orient_for_team:
             _direction_note(ax, f"{team_label(team, team_labels)} attacking →", length=length)
         elif team is None:
-            _direction_note(
-                ax,
-                f"← {team_label('away', team_labels)} attacking    |    "
-                f"{team_label('home', team_labels)} attacking →",
-                length=length,
-            )
+            _direction_note(ax, direction_note_text(team_labels), length=length)
 
-        if colorbar and image is not None:
-            bar = _horizontal_bar(fig, image, ax)
-            bar.set_label("5 s recovery share", size=LABEL_SIZE, color=INK_SOFT)
-            bar.set_ticks([0.0, 0.5, 1.0])
-            bar.ax.tick_params(length=0, labelsize=TICK_SIZE, colors=INK_SOFT)
-            bar.outline.set_visible(False)
+        if colorbar and drawn_teams:
+            # One ramp per team on the map. Two short bars are more honest than
+            # one bar in a hue that only half the marks are drawn in. Reversed,
+            # because each new bar is laid closer to the axes than the last, so
+            # reversing the house order is what puts home on top of away.
+            for side in reversed(drawn_teams):
+                bar = _horizontal_bar(
+                    fig, ScalarMappable(norm=norm, cmap=recovery_cmap(side)), ax
+                )
+                # The team name goes beside the bar rather than under it: two
+                # stacked bars each with a label line underneath is four lines
+                # of chrome for two facts.
+                bar.ax.set_ylabel(
+                    team_label(side, team_labels),
+                    rotation=0.0,
+                    ha="right",
+                    va="center",
+                    labelpad=6.0,
+                    size=LABEL_SIZE,
+                    color=INK_SOFT,
+                )
+                bar.set_ticks([0.0, 0.5, 1.0])
+                bar.set_ticklabels(["walked away", "even", "owned it"])
+                bar.ax.tick_params(length=0, labelsize=TICK_SIZE, colors=INK_SOFT)
+                bar.outline.set_visible(False)
 
         if caption is None:
             unit = "loss" if len(table) == 1 else "losses"
             caption = f"{len(table)} possession {unit}, {n_scored} scored"
-            if size_by is not None:
-                caption += f"; marker area = |{size_by.replace('_', ' ')}|"
+            if colorbar and drawn_teams:
+                caption += "; colour depth = 5 s recovery share"
+            if size_by is not None and reference > 0:
+                caption += (
+                    "; bigger dot = more ground changed hands over the next 5 s, "
+                    f"full size at {format_epv(reference, unit=False)} "
+                    f"{EPV_DISPLAY_UNIT}; solid = the opponent gained it, "
+                    "open ring = the press pushed them back"
+                )
         _caption(fig, caption)
     return fig
 
@@ -1296,23 +1831,37 @@ def phase_bars(
     phase_table: pd.DataFrame,
     *,
     value: str = "mean_recovery",
+    count: str = "scored_losses",
+    min_n: int = MIN_PHASE_LOSSES,
     team_labels: dict[str, str] | None = None,
     title: str = "Recovery by pitch phase",
-    figsize: tuple[float, float] = (7.6, 3.0),
+    caption: str | None = None,
+    figsize: tuple[float, float] = (7.6, 3.2),
     dpi: int = DEFAULT_DPI,
 ) -> Figure:
-    """Plot mean recovery by pitch phase for both teams.
+    """Plot mean recovery by pitch phase for both teams, with sample sizes.
 
     Phase is not a nuisance variable here, it is the dominant one: measured
     mean recovery in Metrica game 1 runs 0.24-0.28 in build-up against 0.70 in
     the final third. Comparing two teams within a phase is meaningful; across
     phases it is not, which is why the bars are grouped by phase.
 
+    Every bar prints the number of losses it rests on, and a bar resting on
+    fewer than ``min_n`` is drawn faded with a hollow face. That is not
+    decoration: in the same match the build-up bars rest on 11 and 13 losses
+    against 53-61 for every other bar, and "build-up 0.28 versus 0.24" reads
+    like a finding until you know it is a difference between two dozen events.
+
     Args:
         phase_table: Output of :func:`pressing.counterpress.per_phase`.
         value: Column to plot.
+        count: Column holding the sample size behind each bar. Falls back to
+            ``"losses"``, then to no annotation, when it is absent.
+        min_n: Bars resting on fewer than this many losses are faded, hollowed
+            and flagged in the caption.
         team_labels: Optional real team names.
         title: Panel title.
+        caption: Caption line. Defaults to a generated one naming ``min_n``.
         figsize: Figure size in inches.
         dpi: Render resolution.
 
@@ -1329,13 +1878,21 @@ def phase_bars(
 
         if phase_table.empty:
             _empty(ax, "No phase data")
+            _caption(fig, caption)
             return fig
+
+        count_col: str | None = None
+        for candidate in (count, "losses"):
+            if candidate in phase_table.columns:
+                count_col = candidate
+                break
 
         phases = list(dict.fromkeys(phase_table["phase"].tolist()))
         teams = ordered_teams(phase_table["team"])
         positions = np.arange(len(phases), dtype=float)
         span = 0.72
         bar_w = span / max(len(teams), 1)
+        thin = 0
 
         for i, side in enumerate(teams):
             block = phase_table[phase_table["team"] == side].set_index("phase")
@@ -1343,29 +1900,63 @@ def phase_bars(
                 float(block[value].get(phase, np.nan)) if value in block.columns else np.nan
                 for phase in phases
             ]
+            counts = [
+                float(block[count_col].get(phase, np.nan)) if count_col else np.nan
+                for phase in phases
+            ]
             offset = -span / 2.0 + bar_w * (i + 0.5)
-            ax.bar(
+            colour = team_colour(side)
+            deep = _mix(colour, _DEEP, 0.35)
+            small = [np.isfinite(n) and n < min_n for n in counts]
+            thin += sum(small)
+            container = ax.bar(
                 positions + offset,
                 heights,
                 width=bar_w * 0.86,
-                color=team_colour(side),
-                edgecolor=SURFACE,
-                linewidth=1.0,
+                # Hue still means team on a faded bar; only its weight changes,
+                # so the low-n flag cannot be mistaken for a third team.
+                color=[_mix(colour, SURFACE, 0.78) if s else colour for s in small],
+                edgecolor=[deep if s else SURFACE for s in small],
+                linewidth=[1.1 if s else 1.0 for s in small],
                 label=team_label(side, team_labels),
                 zorder=3.0,
             )
-            for x, height in zip(positions + offset, heights, strict=True):
-                if np.isfinite(height):
-                    ax.annotate(
-                        f"{height:.2f}",
-                        xy=(x, height),
-                        xytext=(0, 2),
-                        textcoords="offset points",
-                        ha="center",
-                        va="bottom",
-                        fontsize=TICK_SIZE - 0.5,
-                        color=INK_SOFT,
-                    )
+            # Per-bar, not on the container: ``ax.bar`` broadcasts one linestyle
+            # to every bar AND to the legend swatch, which would draw the solid
+            # bars' legend key dashed and undo the whole distinction.
+            for patch, is_small in zip(container, small, strict=True):
+                if is_small:
+                    patch.set_linestyle((0, (2.5, 1.6)))
+            for x, height, n, is_small in zip(
+                positions + offset, heights, counts, small, strict=True
+            ):
+                if not np.isfinite(height):
+                    continue
+                ax.annotate(
+                    f"{height:.2f}",
+                    xy=(x, height),
+                    xytext=(0, 2),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=TICK_SIZE - 0.5,
+                    color=INK_SOFT if not is_small else INK_MUTED,
+                )
+                if not np.isfinite(n):
+                    continue
+                # n rides just under the axis, where it cannot be confused with
+                # the value and cannot be hidden by a short bar.
+                ax.annotate(
+                    f"n={int(n)}" + ("  (low n)" if is_small else ""),
+                    xy=(x, 0.0),
+                    xytext=(0, -4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="top",
+                    fontsize=TICK_SIZE - 1.0,
+                    color=INK_MUTED,
+                    annotation_clip=False,
+                )
 
         ax.axhline(0.5, color=INK_MUTED, linewidth=HAIRLINE, linestyle=(0, (3, 3)), zorder=2.0)
         ax.annotate(
@@ -1381,6 +1972,9 @@ def phase_bars(
         )
         ax.set_xticks(positions)
         ax.set_xticklabels([p.replace("_", " ") for p in phases])
+        # The n labels live under the axis, so the tick labels move down to
+        # clear them rather than landing on top of them.
+        ax.tick_params(axis="x", pad=11.0)
         ax.set_xlim(-0.6, len(phases) - 0.4)
         tallest = max(
             (float(bar.get_height()) for group in ax.containers for bar in group),
@@ -1390,7 +1984,32 @@ def phase_bars(
             # Headroom for the value labels sitting on top of the bars.
             ax.set_ylim(0.0, max(tallest, 0.5) * 1.12)
         if len(teams) > 1:
-            ax.legend(loc="upper left", ncols=len(teams))
+            # Explicit proxies. A BarContainer takes its legend swatch from its
+            # FIRST bar, and the first phase here is build-up, which is exactly
+            # the low-n bar -- so the automatic legend drew both teams' keys in
+            # the faded, dashed style and quietly undid the whole distinction.
+            ax.legend(
+                handles=[
+                    Patch(
+                        facecolor=team_colour(side),
+                        edgecolor=SURFACE,
+                        label=team_label(side, team_labels),
+                    )
+                    for side in teams
+                ],
+                loc="upper left",
+                ncols=len(teams),
+            )
+
+        if caption is None:
+            caption = "n is the number of scored losses behind each bar"
+            if thin:
+                unit = "bar" if thin == 1 else "bars"
+                caption += (
+                    f"; {thin} {unit} rest on fewer than {min_n} losses and are"
+                    " drawn faded — read those as noise, not as a finding"
+                )
+        _caption(fig, caption)
     return fig
 
 
@@ -1464,8 +2083,11 @@ def moment_caption(
         team_labels: Optional real team names.
 
     Returns:
-        A caption of the form ``"58'12\" - Home lost to Player 15 - recovery
-        0.62 - EPV swing +0.0031"``.
+        A caption of the form ``"58'12\" - Home lost the ball (Player 15) -
+        5 s recovery 0.62 - EPV swing +3.10 mEPV"``. The EPV swing goes through
+        :func:`format_epv`, so it is readable rather than four leading zeros;
+        the unit is named in the caption itself and defined by
+        :data:`EPV_UNIT_GLOSS`.
     """
     row = dict(loss)
     parts: list[str] = []
@@ -1487,9 +2109,9 @@ def moment_caption(
     if recovery is not None and np.isfinite(float(recovery)):
         parts.append(f"5 s recovery {float(recovery):.2f}")
 
-    epv = row.get("epv_conceded")
-    if epv is not None and np.isfinite(float(epv)):
-        parts.append(f"EPV swing {float(epv):+.4f}")
+    epv = format_epv(row.get("epv_conceded"))
+    if epv:
+        parts.append(f"EPV swing {epv}")
 
     phase = row.get("phase")
     if phase:
@@ -1502,6 +2124,8 @@ def moment_panel(
     control: np.ndarray,
     *,
     ball: Any = None,
+    ball_last_known: Any = None,
+    loss_xy: Any = None,
     attackers: Any = None,
     defenders: Any = None,
     attacking_team: str = "home",
@@ -1512,6 +2136,8 @@ def moment_panel(
     title: str = "",
     caption: str = "",
     colorbar: bool = True,
+    key: bool = True,
+    direction: bool = True,
     team_labels: dict[str, str] | None = None,
     figsize: tuple[float, float] = (5.4, 4.2),
     dpi: int = DEFAULT_DPI,
@@ -1527,7 +2153,10 @@ def moment_panel(
 
     Args:
         control: ``(n_y, n_x)`` control surface, row 0 at the bottom touchline.
-        ball: ``(2,)`` ball position, or None.
+        ball: ``(2,)`` tracked ball position, or None.
+        ball_last_known: ``(2,)`` held ball position used when ``ball`` is
+            missing, drawn as a dashed ring.
+        loss_xy: ``(2,)`` where the possession was lost. Always marked.
         attackers: ``(n, 2)`` positions of the team in possession.
         defenders: ``(n, 2)`` positions of the counter-pressing team.
         attacking_team: Team the surface measures -- the team that WON the ball.
@@ -1539,6 +2168,8 @@ def moment_panel(
         caption: Caption line, usually from :func:`moment_caption`.
         colorbar: Whether to draw the colourbar. Turn it off in tight 2-up
             layouts where one shared key is enough.
+        key: Whether to draw the ball / turnover key.
+        direction: Whether to draw the attacking-direction note.
         team_labels: Optional real team names.
         figsize: Figure size in inches. ``(5.4, 4.2)`` is half-width A4.
         dpi: Render resolution.
@@ -1552,6 +2183,8 @@ def moment_panel(
     return control_heatmap(
         control,
         ball=ball,
+        ball_last_known=ball_last_known,
+        loss_xy=loss_xy,
         attackers=attackers,
         defenders=defenders,
         attacking_team=attacking_team,
@@ -1562,6 +2195,8 @@ def moment_panel(
         title=title,
         caption=caption,
         colorbar=colorbar,
+        key=key,
+        direction=direction,
         team_labels=team_labels,
         figsize=figsize,
         dpi=dpi,
@@ -1571,18 +2206,65 @@ def moment_panel(
     )
 
 
+#: Inches the strip reserves for its title, per-thumbnail time stamps,
+#: direction note, colourbar and caption, on top of the thumbnails themselves.
+#: Measured on the three-thumbnail default: the figure comes out 2.736 in tall
+#: and the thumbnail axes occupy 1.654 in of it, so the chrome renders in 1.08
+#: in and the constant is a shade under what the layout engine then compresses
+#: it to.
+_STRIP_CHROME_IN: Final[float] = 1.05
+
+
+def strip_figsize(
+    n: int,
+    *,
+    width_in: float = 7.6,
+    length: float = PITCH_LENGTH,
+    pitch_width: float = PITCH_WIDTH,
+    margin: float = GOAL_DEPTH + 0.8,
+) -> tuple[float, float]:
+    """Figure size that fits ``n`` thumbnails with no dead band underneath.
+
+    Each thumbnail axes is pinned to the pitch's own aspect, so its height is
+    fixed once its width is fixed; a figure taller than that leaves blank
+    paper the tight bbox cannot reclaim, because the axes really is that
+    short. Measured: the same three thumbnails asked for a 3.4 in figure
+    render with a 117 px unbroken band of paper at 150 dpi, 21.9% of the
+    image, against 44 px and 10.1% at this height. So the height is derived
+    from the thumbnails rather than guessed, plus :data:`_STRIP_CHROME_IN` for
+    the title, stamps, direction note, colourbar and caption.
+
+    Args:
+        n: Number of thumbnails.
+        width_in: Figure width in inches.
+        length: Pitch length in metres.
+        pitch_width: Pitch width in metres.
+        margin: Metres of breathing room outside the touchlines.
+
+    Returns:
+        ``(width_in, height_in)``.
+    """
+    cell = width_in / max(int(n), 1)
+    aspect = (pitch_width + 2.0 * margin) / (length + 2.0 * margin)
+    return width_in, cell * aspect + _STRIP_CHROME_IN
+
+
 def moment_strip(
     surfaces: Sequence[np.ndarray],
     *,
     offsets: Sequence[float] = (0.0, 2.0, 5.0),
     balls: Sequence[Any] | None = None,
+    ball_last_known: Sequence[Any] | None = None,
+    loss_xy: Any = None,
     attackers: Sequence[Any] | None = None,
     defenders: Sequence[Any] | None = None,
     attacking_team: str = "home",
     title: str = "",
     caption: str = "",
+    colorbar: bool = True,
+    direction: bool = True,
     team_labels: dict[str, str] | None = None,
-    figsize: tuple[float, float] = (7.6, 2.4),
+    figsize: tuple[float, float] | None = None,
     dpi: int = DEFAULT_DPI,
     length: float = PITCH_LENGTH,
     width: float = PITCH_WIDTH,
@@ -1594,17 +2276,31 @@ def moment_strip(
     -- so the coach sees whether the press closed the space or the opponent
     walked out of it. This is the page-5 companion to the hero panel.
 
+    It carries its own key. The strip is a standalone flowable in the report,
+    so it gets the same colourbar naming both teams that the hero panel gets,
+    the same attacking-direction note, and the same turnover cross repeated on
+    every thumbnail as a fixed reference the eye can measure the surface
+    against. Its default height comes from :func:`strip_figsize` rather than a
+    guess, because the axes are pinned to the pitch aspect and a guessed height
+    turns straight into blank paper.
+
     Args:
         surfaces: One ``(n_y, n_x)`` control surface per thumbnail.
         offsets: Seconds after ``t0`` each surface represents. Used for titles.
-        balls: Optional ball position per thumbnail.
+        balls: Optional tracked ball position per thumbnail.
+        ball_last_known: Optional held ball position per thumbnail, drawn as a
+            dashed ring wherever ``balls`` has nothing.
+        loss_xy: ``(2,)`` where the possession was lost, marked on every
+            thumbnail.
         attackers: Optional ``(n, 2)`` attacker positions per thumbnail.
         defenders: Optional ``(n, 2)`` defender positions per thumbnail.
         attacking_team: Team the surfaces measure.
         title: Strip title, drawn above the first thumbnail.
         caption: Caption line beneath the strip.
+        colorbar: Whether to draw the shared control colourbar.
+        direction: Whether to draw the attacking-direction note.
         team_labels: Optional real team names.
-        figsize: Figure size in inches.
+        figsize: Figure size in inches. Defaults to :func:`strip_figsize`.
         dpi: Render resolution.
         length: Pitch length in metres.
         width: Pitch width in metres.
@@ -1620,9 +2316,11 @@ def moment_strip(
         raise ValueError("moment_strip needs at least one surface")
 
     with styled():
-        fig = _new_figure(figsize, dpi)
+        fig = _new_figure(figsize or strip_figsize(len(surfaces), length=length), dpi)
         axes = fig.subplots(1, len(surfaces), squeeze=False)[0]
         other = "away" if str(attacking_team) == "home" else "home"
+        image = None
+        states: list[str] = []
 
         for i, (ax, surface) in enumerate(zip(axes, surfaces, strict=True)):
             draw_pitch(
@@ -1635,7 +2333,7 @@ def moment_strip(
                 linewidth=PITCH_LW * 0.8,
                 margin=GOAL_DEPTH + 0.8,
             )
-            _draw_control(
+            image = _draw_control(
                 ax,
                 surface,
                 attacking_team=attacking_team,
@@ -1651,19 +2349,48 @@ def moment_strip(
                 _draw_players(ax, defenders[i], team_colour(other), size=PLAYER_MS * 0.72)
             if attackers is not None and i < len(attackers):
                 _draw_players(ax, attackers[i], team_colour(attacking_team), size=PLAYER_MS * 0.72)
-            if balls is not None and i < len(balls):
-                _draw_ball(ax, balls[i], size=BALL_MS * 0.7)
+            position, state = resolve_ball(
+                balls[i] if balls is not None and i < len(balls) else None,
+                ball_last_known[i]
+                if ball_last_known is not None and i < len(ball_last_known)
+                else None,
+            )
+            states.append(_draw_ball(ax, position, state=state, size=BALL_MS * 0.8))
+            _draw_turnover(ax, loss_xy, size=13.0)
 
             offset = float(offsets[i]) if i < len(offsets) else float("nan")
             stamp = "t₀" if offset == 0.0 else f"t₀ + {offset:g} s"
             ax.set_title(stamp, fontsize=CAPTION_SIZE, color=INK_SOFT, fontweight="normal")
 
+        if direction:
+            _direction_note(
+                axes[len(axes) // 2],
+                direction_note_text(team_labels, compact=True),
+                length=length,
+                size=CAPTION_SIZE - 1.0,
+            )
         if title:
             fig.suptitle(title, fontsize=TITLE_SIZE, color=INK, fontweight="bold", ha="left", x=0.0)
-        if caption:
-            _caption(fig, caption)
-        else:
-            _caption(fig, f"Control shown for {team_label(attacking_team, team_labels)}")
+        if colorbar and image is not None:
+            _control_colorbar(
+                fig,
+                image,
+                list(axes),
+                attacking_team=attacking_team,
+                team_labels=team_labels,
+                centre=0.5,
+            )
+        if not caption:
+            caption = "Pitch control through the counter-press window"
+            if loss_xy is not None:
+                caption += "; the crosshair is where the ball was lost"
+            if "inferred" in states:
+                caption += "; an open ball ring is the last tracked position, held"
+            if "unknown" in states:
+                n_missing = states.count("unknown")
+                unit = "thumbnail" if n_missing == 1 else "thumbnails"
+                caption += f"; the ball is untracked on {n_missing} {unit}"
+        _caption(fig, caption)
     return fig
 
 

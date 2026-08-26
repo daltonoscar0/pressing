@@ -1,6 +1,6 @@
 """Tests for the report's figure renderers.
 
-Three things are worth testing about a plotting module and the rest is taste:
+What is worth testing about a plotting module, and what the rest is taste:
 
 1. **Does it build at all, headlessly.** Every figure here has to render under
    Agg inside a PDF build, at more than one size, without a display.
@@ -10,8 +10,19 @@ Three things are worth testing about a plotting module and the rest is taste:
    assertion about types or shapes will ever catch it. The test here renders to
    pixels and reads the colours back out, which is the only check that actually
    proves the orientation.
-3. **Do the degenerate inputs survive.** Empty tables, single points and NaN
-   coordinates all occur in real matches and none of them may raise.
+3. **Do the degenerate inputs survive, and survive in the right way.** Empty
+   tables, single points, NaN coordinates and an untracked ball all occur in
+   real matches. None of them may raise -- and none of them may be handled by
+   quietly drawing a mark at the origin, dropping a row without saying so, or
+   printing a panel with nothing on it, which is what "survives" used to mean
+   here. Every degenerate-input test below asserts on artist positions, artist
+   counts or rendered pixels, so it fails on a plausible wrong answer and not
+   only on an exception.
+4. **Does the picture still mean what the caption says.** The encodings are
+   under test, not just the plumbing: hue is the team on every figure, marker
+   fill carries the sign of a signed quantity and marker area its magnitude,
+   an inferred ball is drawn differently from a tracked one, and a scaled
+   number is never printed without its unit.
 
 Nothing here imports ``pyplot``, and one test asserts that the module hasn't
 either -- figures built through ``pyplot`` accumulate in a process-global
@@ -21,12 +32,14 @@ registry and leak straight through a multi-page report build.
 from __future__ import annotations
 
 import sys
+import warnings
 
 import matplotlib
 import numpy as np
 import pandas as pd
 import pytest
 from matplotlib.figure import Figure
+from matplotlib.ft2font import FT2Font
 
 from pressing import plots
 from pressing.schema import PITCH_LENGTH, PITCH_WIDTH
@@ -35,6 +48,12 @@ matplotlib.use("Agg")
 
 HALF_WIDTH = (5.4, 4.2)
 FULL_WIDTH = (7.6, 5.2)
+
+#: Names whose characters live outside Latin-1. reportlab's built-in Helvetica
+#: turns every one of these into a box glyph with no exception raised, and a
+#: matplotlib face without the glyphs does the same with only a warning, so the
+#: registered face is tested against them directly.
+AWKWARD_NAMES = ("Vuković", "Gündoğan", "Łukasz", "Şahin", "Bergström", "Håland")
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +135,42 @@ def closes(fig: Figure) -> None:
         "plots.py must never import pyplot: pyplot figures live in a global "
         "registry and leak through a multi-page report build"
     )
+
+
+def marker_points(ax: matplotlib.axes.Axes) -> np.ndarray:
+    """Every point drawn as a MARKER on an axes, in data coordinates.
+
+    Lines with no marker -- the pitch markings, the velocity leaders, a trend
+    -- are excluded, so this is exactly the set of positions the figure is
+    claiming something sits at.
+    """
+    points = [
+        line.get_xydata()
+        for line in ax.lines
+        if line.get_marker() not in ("None", "none", None, "")
+    ]
+    points += [collection.get_offsets() for collection in ax.collections]
+    if not points:
+        return np.empty((0, 2), dtype=float)
+    return np.vstack([np.asarray(p, dtype=float).reshape(-1, 2) for p in points])
+
+
+def key_labels(ax: matplotlib.axes.Axes) -> list[str]:
+    """Legend labels on an axes, or an empty list when it has no legend."""
+    legend = ax.get_legend()
+    return [] if legend is None else [text.get_text() for text in legend.get_texts()]
+
+
+def notes(ax: matplotlib.axes.Axes) -> list[str]:
+    """Free text drawn on an axes: annotations, direction notes, empty states."""
+    return [text.get_text() for text in ax.texts]
+
+
+def ink_fraction(fig: Figure) -> float:
+    """Fraction of rendered pixels that differ from the paper colour."""
+    pixels = render(fig)
+    paper = np.asarray(matplotlib.colors.to_rgb(plots.SURFACE)) * 255.0
+    return float((np.abs(pixels - paper).max(axis=2) > 6.0).mean())
 
 
 # --------------------------------------------------------------------------- #
@@ -385,16 +440,40 @@ def test_moment_panel_without_a_colourbar_has_one_axes(surface: np.ndarray) -> N
     closes(fig)
 
 
-def test_moment_panel_survives_missing_players_and_ball(surface: np.ndarray) -> None:
-    fig = plots.moment_panel(surface, ball=None, attackers=None, defenders=None)
-    render(fig)
+def test_moment_panel_with_no_players_and_no_ball_draws_no_marks_at_all() -> None:
+    """Nothing known means nothing drawn -- and the panel says the ball is gone.
+
+    The failure this guards against is not an exception. It is a panel that
+    quietly puts a mark at the origin, or an ordinary-looking panel that has
+    simply lost the ball and never mentions it.
+    """
+    fig = plots.moment_panel(np.full((32, 50), 0.5), ball=None, attackers=None, defenders=None)
+    ax = fig.axes[0]
+    assert marker_points(ax).size == 0, "no marker may be drawn for an unknown position"
+    assert "ball untracked here" in key_labels(ax), (
+        "a panel with no ball must SAY it has no ball, not just omit it"
+    )
     closes(fig)
 
 
-def test_moment_panel_ignores_a_nan_ball(surface: np.ndarray) -> None:
-    fig = plots.moment_panel(surface, ball=np.array([np.nan, np.nan]))
-    render(fig)
+def test_moment_panel_drops_a_nan_ball_rather_than_drawing_it_at_the_origin() -> None:
+    """A NaN ball must leave the panel with no ball mark anywhere.
+
+    Named "ignores" and asserting nothing, this test used to pass just as
+    happily on an implementation that drew the NaN ball at (0, 0). It now
+    checks the corner pixel and the artist list.
+    """
+    surface = np.full((32, 50), 0.5)
+    fig = plots.moment_panel(surface, ball=np.array([np.nan, np.nan]), colorbar=False)
+    ax = fig.axes[0]
+    assert marker_points(ax).size == 0
+    assert "ball untracked here" in key_labels(ax)
+    # Pixel-for-pixel identical to a panel that was never given a ball at all.
+    # A NaN drawn at the origin, or anywhere else, breaks this immediately.
+    blank = plots.moment_panel(surface, ball=None, colorbar=False)
+    assert np.array_equal(render(fig), render(blank))
     closes(fig)
+    closes(blank)
 
 
 def test_moment_caption_reads_a_scored_loss_row() -> None:
@@ -413,8 +492,12 @@ def test_moment_caption_reads_a_scored_loss_row() -> None:
     assert "Player6" in caption
     assert "Player23" in caption
     assert "0.85" in caption
-    assert "+0.0007" in caption
     assert "final third" in caption
+    # The EPV swing is scaled and its unit is named. Printed raw at four
+    # decimals -- which is what this asserted before -- every real caption in
+    # Metrica game 1 reads "+0.0001" or "-0.0000".
+    assert f"+0.71 {plots.EPV_DISPLAY_UNIT}" in caption
+    assert "+0.0007" not in caption
 
 
 def test_moment_caption_skips_missing_fields() -> None:
@@ -432,15 +515,16 @@ def test_moment_strip_renders_three_thumbnails(surface: np.ndarray) -> None:
         defenders=[np.zeros((3, 2)) + 20.0] * 3,
         title="Five seconds",
     )
-    assert len(fig.axes) == 3
-    stamps = [ax.get_title(loc="left") for ax in fig.axes]
+    # Three pitches plus the shared colourbar.
+    assert len(fig.axes) == 4
+    stamps = [ax.get_title(loc="left") for ax in fig.axes[:3]]
     assert stamps == ["t₀", "t₀ + 2 s", "t₀ + 5 s"]
     render(fig)
     closes(fig)
 
 
 def test_moment_strip_works_with_one_thumbnail(surface: np.ndarray) -> None:
-    fig = plots.moment_strip([surface], offsets=(0.0,))
+    fig = plots.moment_strip([surface], offsets=(0.0,), colorbar=False)
     assert len(fig.axes) == 1
     closes(fig)
 
@@ -495,11 +579,24 @@ def test_loss_map_keeps_unscored_losses_visible(losses: pd.DataFrame) -> None:
     closes(fig)
 
 
-def test_loss_map_survives_nan_coordinates(losses: pd.DataFrame) -> None:
+def test_loss_map_drops_a_nan_loss_instead_of_plotting_it_at_the_origin(
+    losses: pd.DataFrame,
+) -> None:
+    """A loss with no location must not appear anywhere on the pitch.
+
+    Asserting only that this renders would pass on an implementation that
+    plotted the NaN loss at (0, 0), which is a corner flag and reads as a
+    perfectly ordinary turnover.
+    """
     table = losses.copy()
     table.loc[table.index[0], ["x", "y"]] = np.nan
     fig = plots.loss_map(table)
-    render(fig)
+    drawn = marker_points(fig.axes[0])
+    assert len(drawn) == len(table) - 1
+    assert np.isfinite(drawn).all()
+    assert not np.isclose(drawn, 0.0).all(axis=1).any(), (
+        "a loss with no location must be dropped, not drawn at the origin"
+    )
     closes(fig)
 
 
@@ -545,9 +642,25 @@ def test_recovery_sparkline_handles_an_empty_table(losses: pd.DataFrame) -> None
     closes(fig)
 
 
-def test_recovery_sparkline_handles_a_single_loss(losses: pd.DataFrame) -> None:
-    fig = plots.recovery_sparkline(losses.head(1))
-    render(fig)
+def test_recovery_sparkline_plots_a_single_loss_at_its_own_minute_and_value(
+    losses: pd.DataFrame,
+) -> None:
+    """One loss is one point, at the right minute, at its own value.
+
+    A one-point rolling mean IS the point, so this pins both axes: a smoother
+    that silently returned zeros, or a series plotted against the row index
+    instead of the clock, would pass a bare "it renders" test.
+    """
+    one = losses.head(1)
+    fig = plots.recovery_sparkline(one)
+    ax = fig.axes[0]
+    side = str(one["losing_team"].iloc[0])
+    lines = [line for line in ax.lines if line.get_label() == plots.team_label(side)]
+    assert len(lines) == 1
+    xy = lines[0].get_xydata()
+    assert xy.shape == (1, 2)
+    assert xy[0, 0] == pytest.approx(float(one["t"].iloc[0]) / 60.0)
+    assert xy[0, 1] == pytest.approx(float(one["recovery"].iloc[0]))
     closes(fig)
 
 
@@ -681,28 +794,592 @@ def test_ball_from_tracking_returns_none_when_untracked() -> None:
     assert plots.ball_from_tracking(frame[frame["team"] != "ball"]) is None
 
 
-def test_every_figure_type_builds_and_closes(
+def test_every_figure_type_draws_something_and_closes(
     surface: np.ndarray, losses: pd.DataFrame, season: pd.DataFrame
 ) -> None:
-    """One pass over the whole public surface, the way the report uses it."""
-    figures = [
-        plots.pitch_figure()[0],
-        plots.control_heatmap(surface, figsize=HALF_WIDTH),
-        plots.loss_map(losses),
-        plots.moment_panel(surface, caption="x"),
-        plots.moment_strip([surface, surface, surface]),
-        plots.recovery_sparkline(losses),
-        plots.phase_bars(
-            pd.DataFrame(
-                {
-                    "team": ["home", "away"],
-                    "phase": ["middle", "middle"],
-                    "mean_recovery": [0.5, 0.4],
-                }
-            )
-        ),
-        plots.season_scatter(season),
-    ]
-    for fig in figures:
-        render(fig)
+    """One pass over the whole public surface, the way the report uses it.
+
+    Every figure must actually put ink on the paper. Rendering a blank sheet
+    raises nothing at all, so the old version of this test -- which only called
+    ``render`` and threw the pixels away -- would have passed on eight empty
+    pages. The floors are deliberately loose: the point is "not blank", not a
+    pixel-exact fingerprint that breaks on a font update.
+    """
+    phase_table = pd.DataFrame(
+        {
+            "team": ["home", "away"],
+            "phase": ["middle", "middle"],
+            "mean_recovery": [0.5, 0.4],
+            "scored_losses": [40, 44],
+        }
+    )
+    figures = {
+        "pitch": plots.pitch_figure()[0],
+        "control_heatmap": plots.control_heatmap(surface, figsize=HALF_WIDTH),
+        "loss_map": plots.loss_map(losses),
+        "moment_panel": plots.moment_panel(surface, caption="x"),
+        "moment_strip": plots.moment_strip([surface, surface, surface]),
+        "sparkline": plots.recovery_sparkline(losses),
+        "phase_bars": plots.phase_bars(phase_table),
+        "season_scatter": plots.season_scatter(season),
+    }
+    for name, fig in figures.items():
+        assert fig.axes, f"{name} produced a figure with no axes"
+        assert ink_fraction(fig) > 0.02, f"{name} rendered an all-but-blank page"
         closes(fig)
+
+
+# --------------------------------------------------------------------------- #
+# The ball fallback
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_ball_prefers_tracked_then_held_then_says_it_does_not_know() -> None:
+    tracked, state = plots.resolve_ball(np.array([10.0, 20.0]), np.array([90.0, 60.0]))
+    assert state == "tracked"
+    assert np.allclose(tracked, [10.0, 20.0])
+
+    held, state = plots.resolve_ball(None, np.array([90.0, 60.0]))
+    assert state == "inferred"
+    assert np.allclose(held, [90.0, 60.0])
+
+    held, state = plots.resolve_ball(np.array([np.nan, np.nan]), np.array([90.0, 60.0]))
+    assert state == "inferred"
+    assert np.allclose(held, [90.0, 60.0])
+
+    nothing, state = plots.resolve_ball(None, None)
+    assert state == "unknown"
+    assert nothing is None
+    assert set(plots.BALL_STATES) == {"tracked", "inferred", "unknown"}
+
+
+def test_untracked_ball_falls_back_to_the_last_known_position(surface: np.ndarray) -> None:
+    """The ball is untracked in 39.1% of Metrica game 1's frames.
+
+    Without this fallback two of the five printed top moments render with no
+    ball at all, so the mark has to appear at the held position -- and it has
+    to be visibly a DIFFERENT mark, not a tracked ball drawn on a guess.
+    """
+    held = np.array([70.0, 20.0])
+    fig = plots.moment_panel(surface, ball=None, ball_last_known=held)
+    ax = fig.axes[0]
+    drawn = marker_points(ax)
+    assert len(drawn) == 1
+    assert np.allclose(drawn[0], held)
+    assert "ball (last known)" in key_labels(ax)
+
+    balls = [line for line in ax.lines if line.get_marker() == "o"]
+    assert len(balls) == 1
+    # Open, where a tracked ball is a filled disc. Fill is the whole signal.
+    assert balls[0].get_markerfacecolor() == "none"
+    closes(fig)
+
+
+def test_a_tracked_ball_is_drawn_solid_and_an_inferred_one_is_not(surface: np.ndarray) -> None:
+    at = np.array([70.0, 20.0])
+    tracked = plots.moment_panel(surface, ball=at)
+    inferred = plots.moment_panel(surface, ball=None, ball_last_known=at)
+
+    solid = [line for line in tracked.axes[0].lines if line.get_marker() == "o"]
+    open_ring = [line for line in inferred.axes[0].lines if line.get_marker() == "o"]
+    assert len(solid) == len(open_ring) == 1
+    assert solid[0].get_markerfacecolor() == plots.SURFACE
+    assert open_ring[0].get_markerfacecolor() == "none"
+    assert open_ring[0].get_markersize() > solid[0].get_markersize()
+    assert "ball" in key_labels(tracked.axes[0])
+    assert "ball (last known)" in key_labels(inferred.axes[0])
+    closes(tracked)
+    closes(inferred)
+
+
+def test_a_panel_with_no_ball_still_marks_the_turnover(surface: np.ndarray) -> None:
+    """Never a control panel with no ball AND no indication of the turnover."""
+    loss_xy = np.array([80.0, 40.0])
+    fig = plots.moment_panel(surface, ball=None, ball_last_known=None, loss_xy=loss_xy)
+    ax = fig.axes[0]
+    crosses = [line for line in ax.lines if line.get_marker() is plots.TURNOVER_MARKER]
+    assert len(crosses) == 1
+    assert np.allclose(crosses[0].get_xydata()[0], loss_xy)
+    assert "ball lost here" in key_labels(ax)
+    assert "ball untracked here" in key_labels(ax)
+    closes(fig)
+
+
+def test_the_turnover_cross_never_hides_the_ball_it_sits_on(surface: np.ndarray) -> None:
+    """At t0 the loss location IS the tracked ball, so both land on one point.
+
+    The crosshair therefore has to be open in the middle and drawn under the
+    ball. A filled cross on top swallows the ball and the panel silently loses
+    the mark it was added to protect.
+    """
+    at = np.array([60.0, 34.0])
+    fig = plots.moment_panel(surface, ball=at, loss_xy=at, interpolation="nearest")
+    ax = fig.axes[0]
+    cross = next(line for line in ax.lines if line.get_marker() is plots.TURNOVER_MARKER)
+    ball = next(line for line in ax.lines if line.get_marker() == "o")
+    assert cross.get_markerfacecolor() == "none"
+    assert cross.get_zorder() < ball.get_zorder()
+    # And the ball really survives to the pixels: its centre is paper-coloured,
+    # which neither the ink cross nor the mid-grey surface would leave it.
+    pixels = render(fig)
+    centre = _pixel_at(fig, pixels, at[0], at[1])
+    paper = np.asarray(matplotlib.colors.to_rgb(plots.SURFACE)) * 255.0
+    assert np.linalg.norm(centre - paper) < 30.0
+    closes(fig)
+
+
+def test_moment_strip_holds_the_ball_forward_per_thumbnail(surface: np.ndarray) -> None:
+    at = np.array([44.0, 30.0])
+    fig = plots.moment_strip(
+        [surface, surface, surface],
+        offsets=(0.0, 2.0, 5.0),
+        balls=[at, None, None],
+        ball_last_known=[at, at, at],
+        loss_xy=at,
+    )
+    kinds = []
+    for ax in fig.axes[:3]:
+        ball = next(line for line in ax.lines if line.get_marker() == "o")
+        kinds.append("tracked" if ball.get_markerfacecolor() == plots.SURFACE else "inferred")
+        assert np.allclose(ball.get_xydata()[0], at)
+    assert kinds == ["tracked", "inferred", "inferred"]
+    assert "last tracked position, held" in fig.get_supxlabel()
+    closes(fig)
+
+
+def test_moment_strip_says_so_when_the_ball_is_untracked(surface: np.ndarray) -> None:
+    fig = plots.moment_strip([surface, surface], offsets=(0.0, 2.0), balls=[None, None])
+    for ax in fig.axes[:2]:
+        assert not [line for line in ax.lines if line.get_marker() == "o"]
+    assert "untracked on 2 thumbnails" in fig.get_supxlabel()
+    closes(fig)
+
+
+# --------------------------------------------------------------------------- #
+# The attacking-direction note
+# --------------------------------------------------------------------------- #
+
+
+def test_direction_note_text_names_both_teams_and_both_directions() -> None:
+    text = plots.direction_note_text({"home": "Rovers", "away": "United"})
+    assert "Rovers" in text and "United" in text
+    assert text.index("United") < text.index("Rovers"), "away attacks -x, so it comes first"
+    assert "←" in text and "→" in text
+    compact = plots.direction_note_text({"home": "Rovers", "away": "United"}, compact=True)
+    assert len(compact) < len(text)
+    assert "Rovers" in compact and "United" in compact
+
+
+@pytest.mark.parametrize("builder", ["control_heatmap", "moment_panel"])
+def test_control_surfaces_always_say_which_way_the_teams_attack(
+    surface: np.ndarray, builder: str
+) -> None:
+    """A control surface with no direction note is not information.
+
+    "Away United own the right-hand box" means nothing at all until you know
+    which goal Away United are running at.
+    """
+    labels = {"home": "Rovers", "away": "United"}
+    fig = getattr(plots, builder)(surface, attacking_team="away", team_labels=labels)
+    assert plots.direction_note_text(labels) in notes(fig.axes[0])
+    closes(fig)
+
+
+def test_moment_strip_carries_the_direction_note_once(surface: np.ndarray) -> None:
+    labels = {"home": "Rovers", "away": "United"}
+    fig = plots.moment_strip([surface] * 3, team_labels=labels)
+    printed = [note for ax in fig.axes for note in notes(ax) if "Rovers" in note]
+    assert printed == [plots.direction_note_text(labels, compact=True)]
+    closes(fig)
+
+
+def test_direction_note_can_be_turned_off(surface: np.ndarray) -> None:
+    fig = plots.moment_panel(surface, direction=False)
+    assert not [note for note in notes(fig.axes[0]) if "attacking" in note]
+    closes(fig)
+
+
+def test_loss_map_notes_the_direction_for_one_team_and_for_both(
+    losses: pd.DataFrame,
+) -> None:
+    labels = {"home": "Rovers", "away": "United"}
+    both = plots.loss_map(losses, team_labels=labels)
+    assert plots.direction_note_text(labels) in notes(both.axes[0])
+    one = plots.loss_map(losses, team="away", team_labels=labels)
+    assert "United attacking →" in notes(one.axes[0])
+    closes(both)
+    closes(one)
+
+
+# --------------------------------------------------------------------------- #
+# Reading EPV
+# --------------------------------------------------------------------------- #
+
+
+def test_format_epv_scales_and_names_its_unit() -> None:
+    assert plots.EPV_DISPLAY_SCALE == 1000.0
+    assert plots.format_epv(0.00071) == f"+0.71 {plots.EPV_DISPLAY_UNIT}"
+    assert plots.format_epv(-0.0026) == f"-2.60 {plots.EPV_DISPLAY_UNIT}"
+    assert plots.format_epv(0.00071, unit=False) == "+0.71"
+    # The whole measured range of the raw quantity in Metrica game 1 must come
+    # out as distinguishable numbers, which is the entire point of the scaling.
+    low, high = plots.format_epv(-0.0026426), plots.format_epv(0.0040011)
+    assert low != high
+    assert {low, high}.isdisjoint({"+0.0000", "-0.0000"})
+
+
+def test_format_epv_returns_nothing_for_a_missing_value() -> None:
+    assert plots.format_epv(None) == ""
+    assert plots.format_epv(np.nan) == ""
+    assert plots.format_epv("not a number") == ""
+
+
+def test_epv_unit_is_defined_somewhere_a_report_can_print_it() -> None:
+    assert plots.EPV_DISPLAY_UNIT in plots.EPV_UNIT_GLOSS
+    assert "1000" in plots.EPV_UNIT_GLOSS
+
+
+def test_loss_map_caption_names_the_epv_unit_in_plain_words(losses: pd.DataFrame) -> None:
+    caption = plots.loss_map(losses).get_supxlabel()
+    assert plots.EPV_DISPLAY_UNIT in caption
+    assert "bigger dot" in caption
+    # The old caption was "marker area = |epv conceded|", which is notation, not
+    # a caption. Neither the absolute-value bars nor the raw column name belong.
+    assert "|" not in caption
+    assert "epv_conceded" not in caption
+
+
+# --------------------------------------------------------------------------- #
+# One channel, one meaning
+# --------------------------------------------------------------------------- #
+
+
+def _closer_to(colour: object, target: str, than: str) -> bool:
+    rgb = np.asarray(matplotlib.colors.to_rgb(colour))
+    a = np.asarray(matplotlib.colors.to_rgb(target))
+    b = np.asarray(matplotlib.colors.to_rgb(than))
+    return bool(np.linalg.norm(rgb - a) < np.linalg.norm(rgb - b))
+
+
+def test_recovery_ramp_stays_inside_its_team_hue() -> None:
+    """Hue means team on every page, so the recovery ramp may not spend it.
+
+    The ramp this replaced ran red to indigo, which put page 2 in a colour
+    language none of the other pages spoke.
+    """
+    for side, other in (("home", "away"), ("away", "home")):
+        ramp = plots.recovery_cmap(side)
+        for level in (0.25, 0.5, 0.75, 1.0):
+            assert _closer_to(
+                ramp(level), plots.team_colour(side), plots.team_colour(other)
+            ), f"{side} ramp leaves its own hue at {level}"
+        # And lightness, not hue, is what carries the number.
+        assert sum(ramp(0.05)[:3]) > sum(ramp(0.95)[:3])
+
+
+def test_recovery_ramp_never_reaches_the_paper() -> None:
+    """A loss the press never recovered from is the last mark that may vanish."""
+    paper = np.asarray(matplotlib.colors.to_rgb(plots.SURFACE))
+    pitch = np.asarray(matplotlib.colors.to_rgb(plots.PITCH_FILL))
+    for side in ("home", "away"):
+        low = np.asarray(plots.recovery_cmap(side)(0.0)[:3])
+        assert np.linalg.norm(low - paper) > 0.1
+        assert np.linalg.norm(low - pitch) > 0.1
+
+
+def test_loss_map_colours_each_team_in_its_own_hue() -> None:
+    """Blue is home on this page exactly as it is on every other page.
+
+    One loss per team, at positions that identify which mark is whose, so the
+    hue check cannot be satisfied by matching the wrong collection.
+    """
+    table = pd.DataFrame(
+        {
+            "t": [10.0, 20.0],
+            "losing_team": ["home", "away"],
+            "x": [25.0, 80.0],
+            "y": [10.0, 58.0],
+            "recovery": [0.95, 0.95],
+            "epv_conceded": [0.002, 0.002],
+            "scored": [True, True],
+        }
+    )
+    fig = plots.loss_map(table, orient_for_team=False)
+    # Scatter face colours are resolved from the colormap at DRAW time; read
+    # before that, every mapped collection still reports matplotlib's default
+    # blue and a broken figure passes.
+    fig.canvas.draw()
+    where = {"home": np.array([25.0, 10.0]), "away": np.array([80.0, 58.0])}
+    seen = set()
+    for collection in fig.axes[0].collections:
+        offsets = np.asarray(collection.get_offsets(), dtype=float)
+        if len(offsets) != 1:
+            continue
+        side = next(s for s, xy in where.items() if np.allclose(offsets[0], xy))
+        other = "away" if side == "home" else "home"
+        face = collection.get_facecolor()[0]
+        assert _closer_to(face[:3], plots.team_colour(side), plots.team_colour(other)), (
+            f"the {side} loss is not drawn in the {side} hue"
+        )
+        seen.add(side)
+    assert seen == {"home", "away"}
+    closes(fig)
+
+
+def test_loss_map_puts_the_sign_in_the_fill_and_the_size_in_the_area() -> None:
+    """Two presses of equal magnitude and opposite sign must not look alike.
+
+    Marker area alone is unsigned, so a press that pushed the opponent
+    backwards used to draw exactly as loudly as one that let them make ground.
+    """
+    table = pd.DataFrame(
+        {
+            "t": [10.0, 20.0],
+            "losing_team": ["home", "home"],
+            "x": [30.0, 70.0],
+            "y": [20.0, 48.0],
+            "recovery": [0.6, 0.6],
+            "epv_conceded": [0.003, -0.003],
+            "scored": [True, True],
+        }
+    )
+    fig = plots.loss_map(table)
+    fig.canvas.draw()
+    ax = fig.axes[0]
+    def is_filled(collection: object) -> bool:
+        face = collection.get_facecolor()
+        return bool(len(face)) and float(face[0][3]) > 0.0
+
+    filled = [c for c in ax.collections if is_filled(c)]
+    hollow = [c for c in ax.collections if not is_filled(c)]
+    assert len(filled) == 1 and len(hollow) == 1
+    assert np.allclose(filled[0].get_offsets()[0], [30.0, 20.0])
+    assert np.allclose(hollow[0].get_offsets()[0], [70.0, 48.0])
+    # Equal magnitude, so equal area: the size says how much, the fill says
+    # which way.
+    assert float(filled[0].get_sizes()[0]) == pytest.approx(float(hollow[0].get_sizes()[0]))
+    assert "solid = " in fig.get_supxlabel() and "open ring = " in fig.get_supxlabel()
+    closes(fig)
+
+
+def test_loss_map_marks_unscored_losses_without_using_a_team_hue(
+    losses: pd.DataFrame,
+) -> None:
+    table = losses.copy()
+    table.loc[table.index[:5], "scored"] = False
+    table.loc[table.index[:5], "recovery"] = np.nan
+    fig = plots.loss_map(table)
+    fig.canvas.draw()
+    ax = fig.axes[0]
+    assert "not scored" in key_labels(ax)
+    crosses = [c for c in ax.collections if len(c.get_offsets()) == 5]
+    assert crosses, "the five unscored losses must still be drawn"
+    face = crosses[0].get_edgecolor()[0]
+    assert _closer_to(face[:3], plots.INK_MUTED, plots.HOME_COLOUR)
+    assert _closer_to(face[:3], plots.INK_MUTED, plots.AWAY_COLOUR)
+    closes(fig)
+
+
+def test_loss_map_gives_every_team_shown_its_own_labelled_colourbar(
+    losses: pd.DataFrame,
+) -> None:
+    labels = {"home": "Rovers", "away": "United"}
+    both = plots.loss_map(losses, team_labels=labels)
+    bars = [ax for ax in both.axes if ax.get_label() == "<colorbar>"]
+    assert len(bars) == 2
+    named = {ax.get_ylabel() for ax in bars}
+    assert named == {"Rovers", "United"}
+    assert [t.get_text() for t in bars[0].get_xticklabels()] == [
+        "walked away",
+        "even",
+        "owned it",
+    ]
+    one = plots.loss_map(losses, team="home", team_labels=labels)
+    assert len([ax for ax in one.axes if ax.get_label() == "<colorbar>"]) == 1
+    closes(both)
+    closes(one)
+
+
+# --------------------------------------------------------------------------- #
+# Sample sizes on the phase bars
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def phase_table() -> pd.DataFrame:
+    """The measured Metrica game 1 shape: build-up rests on 11 and 13 losses."""
+    return pd.DataFrame(
+        {
+            "team": ["home"] * 3 + ["away"] * 3,
+            "phase": ["build_up", "middle", "final_third"] * 2,
+            "mean_recovery": [0.28, 0.49, 0.70, 0.24, 0.44, 0.70],
+            "scored_losses": [11, 60, 57, 13, 53, 61],
+        }
+    )
+
+
+def test_phase_bars_print_the_sample_size_on_every_bar(phase_table: pd.DataFrame) -> None:
+    printed = notes(plots.phase_bars(phase_table).axes[0])
+    for n in phase_table["scored_losses"]:
+        assert any(text.startswith(f"n={n}") for text in printed), f"n={n} is not on the chart"
+
+
+def test_phase_bars_fade_and_flag_a_bar_that_rests_on_too_few_losses(
+    phase_table: pd.DataFrame,
+) -> None:
+    """"Build-up 0.28 versus 0.24" reads as a finding until you see n=11."""
+    fig = plots.phase_bars(phase_table, min_n=20)
+    ax = fig.axes[0]
+    bars = {}
+    for container, side in zip(ax.containers, ("home", "away"), strict=True):
+        for patch, phase in zip(container, ("build_up", "middle", "final_third"), strict=True):
+            bars[(side, phase)] = patch
+
+    thin = bars[("home", "build_up")]
+    solid = bars[("home", "middle")]
+    assert _closer_to(thin.get_facecolor(), plots.SURFACE, plots.HOME_COLOUR)
+    assert _closer_to(solid.get_facecolor(), plots.HOME_COLOUR, plots.SURFACE)
+    assert thin.get_linestyle() != solid.get_linestyle()
+    assert any("(low n)" in text for text in notes(ax))
+    caption = fig.get_supxlabel()
+    assert "20" in caption and "2 bars" in caption
+    closes(fig)
+
+
+def test_phase_bars_legend_swatches_stay_solid_when_the_first_bar_is_faded(
+    phase_table: pd.DataFrame,
+) -> None:
+    """A BarContainer takes its legend key from its FIRST bar -- here, a faded one."""
+    fig = plots.phase_bars(phase_table)
+    ax = fig.axes[0]
+    swatches = ax.get_legend().legend_handles
+    assert len(swatches) == 2
+    for swatch, side in zip(swatches, ("home", "away"), strict=True):
+        assert _closer_to(swatch.get_facecolor(), plots.team_colour(side), plots.SURFACE)
+    closes(fig)
+
+
+def test_phase_bars_flag_nothing_when_every_bar_is_well_sampled(
+    phase_table: pd.DataFrame,
+) -> None:
+    fig = plots.phase_bars(phase_table, min_n=5)
+    assert "faded" not in fig.get_supxlabel()
+    assert not [text for text in notes(fig.axes[0]) if "(low n)" in text]
+    closes(fig)
+
+
+def test_phase_bars_fall_back_to_the_loss_count_and_then_to_no_count() -> None:
+    only_losses = pd.DataFrame(
+        {"team": ["home"], "phase": ["middle"], "mean_recovery": [0.5], "losses": [7]}
+    )
+    assert any("n=7" in text for text in notes(plots.phase_bars(only_losses).axes[0]))
+    neither = only_losses.drop(columns=["losses"])
+    assert not [text for text in notes(plots.phase_bars(neither).axes[0]) if "n=" in text]
+
+
+# --------------------------------------------------------------------------- #
+# The strip earns its height
+# --------------------------------------------------------------------------- #
+
+
+def test_strip_figsize_tracks_the_thumbnails_it_has_to_hold() -> None:
+    one = plots.strip_figsize(1)
+    three = plots.strip_figsize(3)
+    assert one[0] == three[0]
+    # Each pitch is pinned to the pitch aspect, so three across are each a
+    # third as wide and a third as tall.
+    assert one[1] > three[1]
+    assert plots.strip_figsize(3, width_in=15.2)[1] > three[1]
+
+
+def test_moment_strip_default_height_is_mostly_thumbnail(surface: np.ndarray) -> None:
+    """Roughly a third of this figure's height used to be blank paper.
+
+    The axes are pinned to the pitch aspect, so a guessed figure height becomes
+    dead space that ``bbox_inches="tight"`` cannot reclaim -- the axes really
+    is that short.
+    """
+    fig = plots.moment_strip([surface] * 3, offsets=(0.0, 2.0, 5.0))
+    fig.canvas.draw()
+    height = fig.get_size_inches()[1]
+    used = sum(ax.get_position().height for ax in fig.axes[:3]) / 3.0
+    assert used * height > 0.55 * height - plots._STRIP_CHROME_IN
+    assert height == pytest.approx(plots.strip_figsize(3)[1])
+    closes(fig)
+
+
+def test_moment_strip_carries_a_colourbar_naming_both_teams(surface: np.ndarray) -> None:
+    """As a standalone page-5 flowable, nothing else says which colour is who."""
+    fig = plots.moment_strip(
+        [surface] * 3, attacking_team="away", team_labels={"home": "Rovers", "away": "United"}
+    )
+    bars = [ax for ax in fig.axes if ax.get_label() == "<colorbar>"]
+    assert len(bars) == 1
+    assert [t.get_text() for t in bars[0].get_xticklabels()] == ["Rovers", "even", "United"]
+    closes(fig)
+
+
+# --------------------------------------------------------------------------- #
+# Fonts
+# --------------------------------------------------------------------------- #
+
+
+def test_register_fonts_adds_matplotlibs_own_dejavu_faces() -> None:
+    paths = plots.register_fonts()
+    assert paths, "matplotlib ships DejaVu Sans in mpl-data/fonts/ttf"
+    assert [path.rsplit("/", 1)[-1] for path in paths] == list(plots.FONT_FILES)
+    for path in paths:
+        assert path.endswith(".ttf")
+
+
+def test_the_face_the_figures_use_has_the_glyphs_real_player_names_need() -> None:
+    """Helvetica turns "Vuković" into "Vukovi" plus a box, silently.
+
+    matplotlib will at least warn, but a warning in a batch PDF build is a
+    warning nobody sees, so the face is checked for the glyphs directly.
+    """
+    with plots.styled():
+        resolved = matplotlib.font_manager.findfont(
+            matplotlib.font_manager.FontProperties(
+                family=matplotlib.rcParams["font.sans-serif"]
+            )
+        )
+    face = FT2Font(resolved)
+    for name in AWKWARD_NAMES:
+        for character in name:
+            assert face.get_char_index(ord(character)) != 0, (
+                f"{resolved} has no glyph for {character!r} in {name!r}"
+            )
+
+
+def test_a_figure_renders_awkward_player_names_without_a_missing_glyph(
+    surface: np.ndarray,
+) -> None:
+    caption = "  ·  ".join(AWKWARD_NAMES)
+    fig = plots.moment_panel(surface, title="Łukasz · Gündoğan", caption=caption)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fig.canvas.draw()
+    missing = [str(w.message) for w in caught if "missing from font" in str(w.message)]
+    assert not missing, missing
+    assert fig.get_supxlabel() == caption
+    closes(fig)
+
+
+def test_awkward_names_actually_reach_the_pixels(season: pd.DataFrame) -> None:
+    """A dropped glyph and a drawn glyph both raise nothing; pixels differ.
+
+    Rendering "Vuković" and "Vukovic" must not produce identical ink -- if it
+    does, the accented character never made it onto the page.
+    """
+    accented = season.copy()
+    accented.loc[accented.index[0], "player"] = "Vuković"
+    plain = season.copy()
+    plain.loc[plain.index[0], "player"] = "Vukovic"
+    a = plots.season_scatter(accented, n_labels=len(season), title="")
+    b = plots.season_scatter(plain, n_labels=len(season), title="")
+    assert any("Vuković" in text.get_text() for text in a.axes[0].texts)
+    assert render(a).shape == render(b).shape
+    assert not np.array_equal(render(a), render(b))
+    closes(a)
+    closes(b)
