@@ -23,6 +23,13 @@ What is worth testing about a plotting module, and what the rest is taste:
    fill carries the sign of a signed quantity and marker area its magnitude,
    an inferred ball is drawn differently from a tracked one, and a scaled
    number is never printed without its unit.
+5. **Can the numbers be read off it.** v0.1.0 shipped a season scatter whose
+   correlation -- the one statistic the chart exists to print -- was covered by
+   a player's name, and six colourbars carrying no digits at all. Neither
+   raised anything, both returned a Figure, and both drew every artist they
+   promised. So the legibility block near the end asserts on geometry measured
+   off the rendered canvas: which boxes overlap which, what falls outside the
+   axes, where a leader line runs, and whether a colour ramp has numbers on it.
 
 Nothing here imports ``pyplot``, and one test asserts that the module hasn't
 either -- figures built through ``pyplot`` accumulate in a process-global
@@ -31,6 +38,7 @@ registry and leak straight through a multi-page report build.
 
 from __future__ import annotations
 
+import math
 import sys
 import warnings
 
@@ -1189,11 +1197,19 @@ def test_loss_map_gives_every_team_shown_its_own_labelled_colourbar(
     assert len(bars) == 2
     named = {ax.get_ylabel() for ax in bars}
     assert named == {"Rovers", "United"}
-    assert [t.get_text() for t in bars[0].get_xticklabels()] == [
-        "walked away",
-        "even",
-        "owned it",
-    ]
+    # Numbers on EVERY bar. These used to read "walked away / even / owned it"
+    # with no number anywhere, so a 0.55 dot and a 0.95 dot were the same mark.
+    for bar in bars:
+        assert [t.get_text() for t in bar.get_xticklabels()] == [
+            "0",
+            "0.25",
+            "0.5",
+            "0.75",
+            "1",
+        ]
+    # ...and the words those numbers mean, once, under the stack.
+    gloss = [ax.get_xlabel() for ax in bars if ax.get_xlabel()]
+    assert gloss == ["5 s recovery share — 0 = walked away, 0.5 = even, 1 = owned it"]
     one = plots.loss_map(losses, team="home", team_labels=labels)
     assert len([ax for ax in one.axes if ax.get_label() == "<colorbar>"]) == 1
     closes(both)
@@ -1315,7 +1331,345 @@ def test_moment_strip_carries_a_colourbar_naming_both_teams(surface: np.ndarray)
     )
     bars = [ax for ax in fig.axes if ax.get_label() == "<colorbar>"]
     assert len(bars) == 1
-    assert [t.get_text() for t in bars[0].get_xticklabels()] == ["Rovers", "even", "United"]
+    # Both channels: the number on top, who it belongs to underneath. Team
+    # names alone -- which is what this printed before -- mean no value can be
+    # read off any cell of any surface in the strip.
+    assert [t.get_text() for t in bars[0].get_xticklabels()] == [
+        "0\nRovers",
+        "0.25",
+        "0.5\neven",
+        "0.75",
+        "1\nUnited",
+    ]
+    assert bars[0].get_xlabel() == "probability United reaches the ball there first"
+    closes(fig)
+
+
+# --------------------------------------------------------------------------- #
+# Legibility: can the numbers actually be read off the picture
+#
+# Every assertion here is geometric and measured off the rendered canvas. A
+# test that only calls the renderer is worth nothing against this class of bug:
+# v0.1.0's season scatter raised nothing, returned a Figure, drew every artist
+# it promised, and shipped a PNG whose headline statistic was covered by a
+# player's name.
+# --------------------------------------------------------------------------- #
+
+
+def text_boxes(fig: Figure) -> dict[str, object]:
+    """Every drawn annotation's TEXT box, in display pixels, keyed by its string.
+
+    Measured through :class:`matplotlib.text.Text` directly rather than through
+    ``plots``'s own helper, so a bug in the helper cannot hide a collision from
+    the test that exists to catch it. ``Annotation.get_window_extent`` is not
+    usable here: it unions in the leader line, which would report a label as
+    occupying the whole corridor back to its marker.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes: dict[str, object] = {}
+    for ax in fig.axes:
+        for text in ax.texts:
+            if not text.get_text():
+                continue
+            if hasattr(text, "update_positions"):
+                text.update_positions(renderer)
+            boxes[text.get_text()] = matplotlib.text.Text.get_window_extent(text)
+    return boxes
+
+
+def shared_area(one: object, other: object) -> float:
+    """Area two display-space boxes share, in square pixels."""
+    dx = min(one.x1, other.x1) - max(one.x0, other.x0)  # type: ignore[attr-defined]
+    dy = min(one.y1, other.y1) - max(one.y0, other.y0)  # type: ignore[attr-defined]
+    return float(dx * dy) if dx > 0.0 and dy > 0.0 else 0.0
+
+
+def colourbars(fig: Figure) -> list[matplotlib.axes.Axes]:
+    """Every colourbar axes on a figure."""
+    return [ax for ax in fig.axes if ax.get_label() == "<colorbar>"]
+
+
+#: Where the six labelled points sat on the chart that shipped broken: high in
+#: the cloud and spread over the top two decades of market value, with the
+#: highest of them far enough right that a name growing rightwards from it runs
+#: into the corner the correlation note is pinned to. Round numbers picked to
+#: reproduce that LAYOUT -- no season data is reproduced here, and none needs
+#: to be, since the defect was entirely geometric.
+LABELLED_LAYOUT: tuple[tuple[float, float], ...] = (
+    (3.0e6, 10.7),
+    (3.5e6, 12.0),
+    (5.0e6, 12.1),
+    (8.0e6, 11.9),
+    (1.3e7, 11.4),
+    (5.5e7, 10.4),
+)
+
+
+@pytest.fixture
+def crowded_season() -> pd.DataFrame:
+    """A synthetic of the chart that shipped broken: La Liga 2015/2016.
+
+    Calibrated to the real one rather than invented, because the placement
+    problem is entirely a matter of geometry and an arbitrary fixture tests an
+    arbitrary geometry. 105 plotted players, market values spread over the
+    three decades the real table spans, a cloud around 5.5 per 90, and the six
+    largest residuals placed at :data:`LABELLED_LAYOUT`. The names are full
+    length on purpose -- "Hernán Arsenio Pérez González (Espanyol)" is over
+    300 px wide at print size and has to go somewhere.
+    """
+    rng = np.random.default_rng(17)
+    cloud = 99
+    value = np.concatenate(
+        [10 ** rng.uniform(5.0, 8.1, cloud), [v for v, _ in LABELLED_LAYOUT]]
+    )
+    metric = np.concatenate(
+        [np.clip(5.5 + rng.normal(0.0, 1.9, cloud), 1.2, 10.0), [m for _, m in LABELLED_LAYOUT]]
+    )
+    n = value.size
+    return pd.DataFrame(
+        {
+            "player": [f"Aurelio Buendía Number {i}" for i in range(n)],
+            "team": [f"Real Sociedad {i % 4}" for i in range(n)],
+            "minutes": rng.uniform(400.0, 3000.0, n),
+            "counterpress_per_90": metric,
+            "market_value_eur": value,
+        }
+    )
+
+
+def test_the_correlation_note_is_never_overprinted_by_a_label(
+    crowded_season: pd.DataFrame,
+) -> None:
+    """The one number the chart exists to print has to be readable.
+
+    v0.1.0 annotated the note AFTER ``_declutter`` and left it out of the
+    collision set entirely, so on the shipped La Liga PNG "Samuel Castillejo
+    Azuaga (Villarreal)" printed straight through "r = -0.09" and neither could
+    be read. The note now goes in as a fixed obstacle, so nothing may touch it.
+    """
+    fig = plots.season_scatter(crowded_season, n_labels=6)
+    boxes = text_boxes(fig)
+    note = next(text for text in boxes if text.startswith("r = "))
+    for text, box in boxes.items():
+        if text == note:
+            continue
+        assert shared_area(boxes[note], box) == 0.0, (
+            f"{text!r} is printed over the correlation note {note!r}"
+        )
+    closes(fig)
+
+
+def test_point_labels_never_print_over_one_another(crowded_season: pd.DataFrame) -> None:
+    """Two player names in the same pixels name nobody."""
+    fig = plots.season_scatter(crowded_season, n_labels=6)
+    boxes = text_boxes(fig)
+    names = sorted(boxes)
+    for i, first in enumerate(names):
+        for second in names[i + 1 :]:
+            assert shared_area(boxes[first], boxes[second]) == 0.0, (
+                f"{first!r} and {second!r} overlap"
+            )
+    closes(fig)
+
+
+def test_point_labels_stay_inside_the_axes(crowded_season: pd.DataFrame) -> None:
+    """A label off the edge is unattributable, and it wrecks the layout too.
+
+    ``savefig(bbox_inches="tight")`` grows the canvas to swallow the overflow,
+    which is what threw the shipped scatter's title off-centre.
+    """
+    fig = plots.season_scatter(crowded_season, n_labels=6)
+    boxes = text_boxes(fig)
+    fig.canvas.draw()
+    frame = fig.axes[0].get_window_extent(renderer=fig.canvas.get_renderer())
+    for text, box in boxes.items():
+        escaped = box.width * box.height - shared_area(box, frame)
+        assert escaped == 0.0, f"{text!r} hangs {escaped:.0f} px² outside the axes"
+    closes(fig)
+
+
+def test_a_label_that_had_to_move_is_joined_to_its_point(
+    crowded_season: pd.DataFrame,
+) -> None:
+    """Displacement without a leader line is the defect, not the displacement.
+
+    v0.1.0 pushed three names 22.8 pt below their anchors and drew nothing
+    joining them, so six orange-ringed points could not be matched to six
+    names. Near labels still get no line: a stub through every marker is
+    clutter, and the point is right there.
+    """
+    fig = plots.season_scatter(crowded_season, n_labels=6)
+    fig.canvas.draw()
+    labelled = [
+        text
+        for text in fig.axes[0].texts
+        if getattr(text, "arrow_patch", None) is not None
+    ]
+    assert len(labelled) == 6
+    for text in labelled:
+        moved = math.hypot(*text.get_position()) > plots._LEADER_AT
+        assert text.arrow_patch.get_visible() is moved, (
+            f"{text.get_text()!r} sits at {text.get_position()} with "
+            f"leader visible={text.arrow_patch.get_visible()}"
+        )
+    closes(fig)
+
+
+def test_no_leader_line_is_drawn_through_another_label(
+    crowded_season: pd.DataFrame,
+) -> None:
+    """A hairline ruled across a player's name is a strikethrough, not a key."""
+    fig = plots.season_scatter(crowded_season, n_labels=6)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = text_boxes(fig)
+    for text in fig.axes[0].texts:
+        arrow = getattr(text, "arrow_patch", None)
+        if arrow is None or not arrow.get_visible():
+            continue
+        text.update_positions(renderer)
+        ends = np.asarray(arrow.get_path().vertices)[[0, -1]]
+        for other, box in boxes.items():
+            if other == text.get_text():
+                continue
+            struck = plots._segment_in_box(tuple(ends[0]), tuple(ends[1]), box)
+            assert struck == 0.0, (
+                f"{text.get_text()!r}'s leader rules {struck:.0f} px across {other!r}"
+            )
+    closes(fig)
+
+
+def test_a_labelled_marker_is_never_buried_under_a_different_name(
+    crowded_season: pd.DataFrame,
+) -> None:
+    """The ringed point is the claim; a name on top of it hides the evidence."""
+    fig = plots.season_scatter(crowded_season, n_labels=6)
+    fig.canvas.draw()
+    ax = fig.axes[0]
+    # Selected by having a data-space anchor rather than by owning a leader
+    # line, so this stays a real test against a build that draws no leaders at
+    # all. The correlation note is anchored in axes fractions and drops out.
+    anchored = [t for t in ax.texts if getattr(t, "xycoords", None) == "data"]
+    assert len(anchored) == 6
+    boxes = text_boxes(fig)
+    for text in anchored:
+        spot = ax.transData.transform(text.xy)
+        for other, box in boxes.items():
+            if other == text.get_text():
+                continue
+            assert not (
+                box.x0 <= spot[0] <= box.x1 and box.y0 <= spot[1] <= box.y1
+            ), f"{text.get_text()!r}'s marker is under the label {other!r}"
+    closes(fig)
+
+
+def test_the_note_reports_the_sample_size_and_an_interval(season: pd.DataFrame) -> None:
+    """A bare r cannot say whether a null was measured or merely not ruled out."""
+    fig = plots.season_scatter(season)
+    note = next(t.get_text() for t in fig.axes[0].texts if t.get_text().startswith("r = "))
+    assert f"(n = {len(season)})" in note
+    assert "95% CI" in note
+    closes(fig)
+
+
+def test_the_interval_on_the_note_reproduces_the_shipped_la_liga_figure() -> None:
+    """Fisher-z against the measured La Liga scatter: r = -0.0927 over 105 players."""
+    low, high = plots._pearson_ci(-0.0927, 105)
+    assert (round(low, 3), round(high, 3)) == (-0.279, 0.101)
+    # Degenerate inputs have no interval and must say so rather than invent one.
+    assert all(np.isnan(plots._pearson_ci(0.5, 3)))
+    assert all(np.isnan(plots._pearson_ci(1.0, 50)))
+
+
+@pytest.mark.parametrize("expected_bars", [1])
+def test_every_colourbar_on_a_moment_panel_can_be_read_as_a_number(
+    surface: np.ndarray, expected_bars: int
+) -> None:
+    """A colour ramp with no numbers on it cannot separate 0.55 from 0.95."""
+    fig = plots.moment_panel(surface, team_labels={"home": "Rovers", "away": "United"})
+    bars = colourbars(fig)
+    assert len(bars) == expected_bars
+    for bar in bars:
+        numbers = [t.get_text().split("\n")[0] for t in bar.get_xticklabels()]
+        assert len(numbers) >= 3
+        assert [float(n) for n in numbers] == sorted(float(n) for n in numbers)
+        assert bar.get_xlabel(), "a colourbar with no axis label names no quantity"
+    closes(fig)
+
+
+def test_every_figure_with_a_colourbar_puts_numbers_on_it(
+    surface: np.ndarray, losses: pd.DataFrame
+) -> None:
+    """Swept across every renderer that draws one. None of them had numbers.
+
+    The loss map's bars carry the recovery scale and the control bars carry the
+    pitch-control probability; on the shipped PDF neither printed a single
+    digit, so no value could be read off any heatmap cell or any dot on any of
+    the six pages.
+    """
+    labels = {"home": "Rovers", "away": "United"}
+    figures = {
+        "loss_map": plots.loss_map(losses, team_labels=labels),
+        "loss_map_one_team": plots.loss_map(losses, team="home", team_labels=labels),
+        "control_heatmap": plots.control_heatmap(surface, team_labels=labels),
+        "moment_panel": plots.moment_panel(surface, team_labels=labels),
+        "moment_strip": plots.moment_strip([surface] * 3, team_labels=labels),
+    }
+    for name, fig in figures.items():
+        bars = colourbars(fig)
+        assert bars, f"{name} draws no colourbar"
+        for bar in bars:
+            numbers = [t.get_text().split("\n")[0] for t in bar.get_xticklabels()]
+            assert len(numbers) >= 3, f"{name} has only {numbers} on a colourbar"
+            values = [float(n) for n in numbers]
+            assert values == sorted(values), f"{name} ticks out of order: {values}"
+            assert values[0] == 0.0 and values[-1] == 1.0, (
+                f"{name} does not label both ends of the ramp: {values}"
+            )
+        # Exactly one axis label per stack of bars: the quantity, named once.
+        assert len([bar for bar in bars if bar.get_xlabel()]) == 1, (
+            f"{name} names the quantity {len([b for b in bars if b.get_xlabel()])} times"
+        )
+        closes(fig)
+
+
+def test_the_moment_key_says_which_dots_are_which_team(
+    surface: np.ndarray, players: dict[str, np.ndarray]
+) -> None:
+    """The panel draws 22 coloured dots and used to name none of them."""
+    fig = plots.moment_panel(
+        surface,
+        attackers=players["attackers"],
+        defenders=players["defenders"],
+        ball=players["ball"],
+        attacking_team="home",
+        team_labels={"home": "Rovers", "away": "United"},
+    )
+    assert {"Rovers", "United"} <= set(key_labels(fig.axes[0]))
+    closes(fig)
+
+
+def test_the_moment_key_promises_only_the_teams_it_drew(surface: np.ndarray) -> None:
+    """A key entry for a team with no tracked positions is a lie about the frame."""
+    fig = plots.moment_panel(surface, team_labels={"home": "Rovers", "away": "United"})
+    assert not {"Rovers", "United"} & set(key_labels(fig.axes[0]))
+    closes(fig)
+
+
+def test_the_loss_map_key_puts_a_scale_on_the_dot_sizes(losses: pd.DataFrame) -> None:
+    """Marker area is a quantitative channel; prose in the caption is not a key.
+
+    The reference is the 95th percentile of the magnitudes, so the key's top
+    entry has to be that value with its unit, not a hardcoded number.
+    """
+    fig = plots.loss_map(losses, size_by="epv_conceded")
+    magnitude = np.abs(losses["epv_conceded"].to_numpy(dtype=float))
+    reference = float(np.percentile(magnitude, 95.0))
+    keys = key_labels(fig.axes[0])
+    assert plots.format_epv(reference) in keys
+    assert plots.format_epv(0.0) in keys
+    assert sum(plots.EPV_DISPLAY_UNIT in k for k in keys) == 3
     closes(fig)
 
 

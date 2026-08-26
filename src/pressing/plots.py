@@ -84,6 +84,7 @@ dependency and works on a fresh offline clone.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
@@ -102,6 +103,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Arc, Ellipse, Patch, Rectangle
 from matplotlib.path import Path as MarkerPath
+from matplotlib.text import Text
 
 from pressing.pitchcontrol import players_from_tracking
 from pressing.schema import PITCH_LENGTH, PITCH_WIDTH
@@ -1195,6 +1197,50 @@ def _draw_control(
     )
 
 
+def _ramp_ticks(centre: float = 0.5) -> list[float]:
+    """Tick positions across a 0-1 ramp: both ends, the midpoint and a quarter.
+
+    Args:
+        centre: The value that reads as neutral.
+
+    Returns:
+        Ascending, de-duplicated tick positions.
+    """
+    return sorted({0.0, centre / 2.0, centre, (centre + 1.0) / 2.0, 1.0})
+
+
+def _tick_number(value: float) -> str:
+    """Format a 0-1 ramp tick shortly: no trailing zeros, no bare decimal point.
+
+    Args:
+        value: The tick position.
+
+    Returns:
+        ``"0"``, ``"0.25"``, ``"0.5"``, ``"0.75"``, ``"1"`` and so on.
+    """
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _stacked_tick(value: float, gloss: str | None) -> str:
+    """A tick label carrying the number on top and its meaning underneath.
+
+    Both channels or neither. The number alone is unreadable to a coach who
+    does not know which end is theirs; the word alone -- which is what these
+    bars used to print -- means no value can be read off the surface at all,
+    and a blue cell at 0.55 looks identical to one at 0.95.
+
+    Args:
+        value: The tick position.
+        gloss: Word to print under it, or None for a bare number.
+
+    Returns:
+        The label text.
+    """
+    number = _tick_number(value)
+    return number if gloss is None else f"{number}\n{gloss}"
+
+
 def _control_colorbar(
     fig: Figure,
     image: mpl.image.AxesImage,
@@ -1204,7 +1250,7 @@ def _control_colorbar(
     team_labels: dict[str, str] | None,
     centre: float,
 ) -> None:
-    """Add the control colourbar, labelled with team names rather than numbers.
+    """Add the control colourbar: numeric ticks, glossed with the team names.
 
     Args:
         fig: Figure to attach to.
@@ -1215,12 +1261,19 @@ def _control_colorbar(
         centre: The neutral value.
     """
     other = "away" if str(attacking_team) == "home" else "home"
+    mine = team_label(attacking_team, team_labels)
+    gloss = {0.0: team_label(other, team_labels), centre: "even", 1.0: mine}
     bar = _horizontal_bar(fig, image, ax)
-    bar.set_ticks([0.0, centre, 1.0])
-    bar.set_ticklabels(
-        [team_label(other, team_labels), "even", team_label(attacking_team, team_labels)]
-    )
+    ticks = _ramp_ticks(centre)
+    bar.set_ticks(ticks)
+    bar.set_ticklabels([_stacked_tick(t, gloss.get(t)) for t in ticks])
     bar.ax.tick_params(length=0, labelsize=TICK_SIZE, colors=INK_SOFT)
+    bar.ax.set_xlabel(
+        f"probability {mine} reaches the ball there first",
+        size=LABEL_SIZE,
+        color=INK_SOFT,
+        labelpad=3.0,
+    )
     bar.outline.set_visible(False)
 
 
@@ -1263,19 +1316,27 @@ def _moment_key(
     ball_state: str,
     turnover: bool,
 ) -> None:
-    """Draw the small ball / turnover key above a moment panel.
+    """Draw the small player / ball / turnover key above a moment panel.
 
     Only the marks actually present are listed, and the "ball untracked" state
     is listed too. That is the point of it: the ball is missing at 14.97% of
     the sampled timepoints in game 1, and a panel that just leaves it out is
     indistinguishable from a panel where nothing happened.
 
+    The team markers come first and are taken from the artists
+    :func:`_draw_players` actually drew, so a team with no tracked positions is
+    absent from the key rather than promised. They used to be absent
+    unconditionally, on the reasoning that the colourbar names both teams and
+    the markers share its poles -- true, but it left a reader working out from
+    a colour ramp which dots were whose.
+
     Args:
         ax: Pitch axes.
         ball_state: One of :data:`BALL_STATES`.
         turnover: Whether a turnover cross was drawn.
     """
-    handles: list[Line2D] = []
+    drawn, _ = ax.get_legend_handles_labels()
+    handles: list[Line2D] = list(drawn)
     if turnover:
         handles.append(
             Line2D(
@@ -1332,6 +1393,9 @@ def _moment_key(
         borderaxespad=0.0,
         handletextpad=0.4,
         columnspacing=1.2,
+        # The team entries carry a full-size player marker; scaled down here so
+        # a four-entry key still fits on one row above a 7.6 in panel.
+        markerscale=0.72,
     )
 
 
@@ -1513,11 +1577,22 @@ def _mirror(xy: np.ndarray, length: float, width: float) -> np.ndarray:
     return out
 
 
+#: Marker area, in points squared, of a zero-magnitude loss on the loss map,
+#: and of one at or above the reference. Named because the size KEY has to draw
+#: the same two extremes the marks are drawn at.
+_SIZE_FLOOR: Final[float] = 16.0
+_SIZE_CEILING: Final[float] = 130.0
+
+#: Most entries the key above a pitch may put on one row. Five short entries
+#: run wider than a 7.6 in panel and matplotlib will not wrap them for you.
+_KEY_MAX_COLS: Final[int] = 3
+
+
 def _size_from_magnitude(
     magnitude: np.ndarray,
     *,
-    floor: float = 16.0,
-    ceiling: float = 130.0,
+    floor: float = _SIZE_FLOOR,
+    ceiling: float = _SIZE_CEILING,
     reference: float | None = None,
 ) -> tuple[np.ndarray, float]:
     """Map an unsigned magnitude to marker area, on a robust scale.
@@ -1757,12 +1832,40 @@ def loss_map(
                         label="not scored",
                     )
                 )
+            # The size key. Marker area is a second quantitative channel and it
+            # had no key at all -- the reference was stated in the caption as
+            # prose, which tells a reader what the biggest dot means but gives
+            # them nothing to compare a middling one against. Legend markers
+            # take a diameter, the scatter takes an area, hence the square root.
+            if size_by is not None and reference > 0:
+                for area, magnitude in (
+                    (_SIZE_FLOOR, 0.0),
+                    (0.5 * (_SIZE_FLOOR + _SIZE_CEILING), 0.5 * reference),
+                    (_SIZE_CEILING, reference),
+                ):
+                    handles.append(
+                        Line2D(
+                            [],
+                            [],
+                            linestyle="none",
+                            marker="o",
+                            markerfacecolor=_mix(INK_MUTED, SURFACE, 0.35),
+                            markeredgecolor=INK_MUTED,
+                            markeredgewidth=0.6,
+                            markersize=math.sqrt(area),
+                            label=format_epv(magnitude),
+                        )
+                    )
+
             if handles:
+                # Two rows once the size key is in: five entries on one row
+                # runs wider than the pitch and matplotlib silently lets it.
+                ncols = min(len(handles), _KEY_MAX_COLS)
                 ax.legend(
                     handles=handles,
                     loc="lower right",
                     bbox_to_anchor=(1.0, 1.0),
-                    ncols=len(handles),
+                    ncols=ncols,
                     borderaxespad=0.0,
                     handletextpad=0.4,
                     columnspacing=1.2,
@@ -1773,7 +1876,8 @@ def loss_map(
             # Short on purpose: the colourbars already say what colour means.
             title = f"Possession losses — {who}"
         # The legend lives in this pad, right-aligned, one row below the title.
-        ax.set_title(title, pad=_TITLE_PAD_WITH_KEY if handles else None)
+        rows = -(-len(handles) // _KEY_MAX_COLS) if handles else 0
+        ax.set_title(title, pad=_TITLE_PAD_WITH_KEY * rows if rows else None)
 
         if team is not None and orient_for_team:
             _direction_note(ax, f"{team_label(team, team_labels)} attacking →", length=length)
@@ -1785,10 +1889,12 @@ def loss_map(
             # one bar in a hue that only half the marks are drawn in. Reversed,
             # because each new bar is laid closer to the axes than the last, so
             # reversing the house order is what puts home on top of away.
+            bars = []
             for side in reversed(drawn_teams):
                 bar = _horizontal_bar(
                     fig, ScalarMappable(norm=norm, cmap=recovery_cmap(side)), ax
                 )
+                bars.append(bar)
                 # The team name goes beside the bar rather than under it: two
                 # stacked bars each with a label line underneath is four lines
                 # of chrome for two facts.
@@ -1801,10 +1907,24 @@ def loss_map(
                     size=LABEL_SIZE,
                     color=INK_SOFT,
                 )
-                bar.set_ticks([0.0, 0.5, 1.0])
-                bar.set_ticklabels(["walked away", "even", "owned it"])
+                # Numbers on every bar, because both ramps run the same 0-1
+                # scale and a reader must be able to put a value on any dot.
+                # These used to read "walked away / even / owned it" with no
+                # number at all, which made 0.55 and 0.95 indistinguishable.
+                ticks = _ramp_ticks()
+                bar.set_ticks(ticks)
+                bar.set_ticklabels([_tick_number(t) for t in ticks])
                 bar.ax.tick_params(length=0, labelsize=TICK_SIZE, colors=INK_SOFT)
                 bar.outline.set_visible(False)
+            # The words those numbers mean go once, under the whole stack, on
+            # the bar furthest from the pitch -- repeating them per bar is four
+            # lines of chrome for one scale.
+            bars[0].ax.set_xlabel(
+                "5 s recovery share — 0 = walked away, 0.5 = even, 1 = owned it",
+                size=LABEL_SIZE,
+                color=INK_SOFT,
+                labelpad=3.0,
+            )
 
         if caption is None:
             unit = "loss" if len(table) == 1 else "losses"
@@ -2013,32 +2133,324 @@ def phase_bars(
     return fig
 
 
-def _declutter(fig: Figure, annotations: Sequence[Any], max_steps: int = 8) -> None:
-    """Nudge overlapping point labels apart, in points, after a trial draw.
+def _text_box(ann: Any, renderer: Any) -> Any:
+    """Window extent of an annotation's TEXT, excluding any leader line.
 
-    Only a handful of labels are ever placed, so the cost of one extra draw is
-    trivial next to the cost of two player names printed on top of each other.
-    Offsets are moved in typographic points rather than pixels, so the result
-    survives being re-rendered at a different dpi.
+    :meth:`matplotlib.text.Annotation.get_window_extent` unions the text box
+    with the arrow patch, so a label parked 30 pt from its point reports a box
+    stretching all the way back to the marker. Collision testing has to run on
+    the glyphs alone: leader lines crossing each other is fine and sometimes
+    unavoidable, two player names printed on top of each other is the defect
+    this machinery exists to prevent. Leaders are charged for separately, by
+    :func:`_segment_in_box`, and only against the text they actually cross.
+
+    Args:
+        ann: The annotation.
+        renderer: Renderer to measure against.
+
+    Returns:
+        The text-only bounding box, in display pixels.
+    """
+    ann.update_positions(renderer)
+    return Text.get_window_extent(ann)
+
+
+def _overlap_area(box: Any, other: Any) -> float:
+    """Area two bounding boxes share, in square display pixels.
+
+    Area rather than a boolean, because when nothing fits -- and with six long
+    Spanish names on one scatter something eventually does not -- the least-bad
+    placement is the one that hides the fewest glyphs, and a boolean cannot
+    rank that.
+
+    Args:
+        box: First box.
+        other: Second box.
+
+    Returns:
+        Shared area, 0.0 when they are disjoint.
+    """
+    dx = min(box.x1, other.x1) - max(box.x0, other.x0)
+    dy = min(box.y1, other.y1) - max(box.y0, other.y0)
+    return float(dx * dy) if dx > 0.0 and dy > 0.0 else 0.0
+
+
+def _spill_area(box: Any, bounds: Any) -> float:
+    """Area of ``box`` falling outside ``bounds``, in square display pixels.
+
+    Args:
+        box: The label's box.
+        bounds: The frame it must stay inside, or None to skip the test.
+
+    Returns:
+        Escaped area, 0.0 when it fits or when ``bounds`` is None.
+    """
+    if bounds is None:
+        return 0.0
+    return float(box.width * box.height) - _overlap_area(box, bounds)
+
+
+def _segment_in_box(start: tuple[float, float], end: tuple[float, float], box: Any) -> float:
+    """Length of a line segment lying inside a box, in display pixels.
+
+    Liang-Barsky clipping. Used to price a leader line that runs across a
+    player's name: a struck-through name is not much more readable than an
+    overprinted one, and a placement engine that scores only glyph-on-glyph
+    collisions will happily draw one.
+
+    Args:
+        start: Segment start in display pixels.
+        end: Segment end in display pixels.
+        box: The box to clip against.
+
+    Returns:
+        Clipped length, 0.0 when the segment misses the box entirely.
+    """
+    (x0, y0), (x1, y1) = start, end
+    dx, dy = x1 - x0, y1 - y0
+    low, high = 0.0, 1.0
+    for edge, room in (
+        (-dx, x0 - box.x0),
+        (dx, box.x1 - x0),
+        (-dy, y0 - box.y0),
+        (dy, box.y1 - y0),
+    ):
+        if edge == 0.0:
+            if room < 0.0:
+                return 0.0
+            continue
+        cut = room / edge
+        if edge < 0.0:
+            low = max(low, cut)
+        else:
+            high = min(high, cut)
+    return math.hypot(dx, dy) * (high - low) if high > low else 0.0
+
+
+def _centre(box: Any) -> tuple[float, float]:
+    """Midpoint of a box, in display pixels.
+
+    Args:
+        box: The box.
+
+    Returns:
+        ``(x, y)``.
+    """
+    return (0.5 * (box.x0 + box.x1), 0.5 * (box.y0 + box.y1))
+
+
+def _anchor_halo(ann: Any, renderer: Any, pad: float) -> Any:
+    """A small box round the marker an annotation points at.
+
+    The point a label names is the one thing on the chart that must stay
+    visible: a ringed outlier hidden under a different player's name is exactly
+    as unattributable as a label with no leader.
+
+    Args:
+        ann: The annotation, whose ``xy`` is in data coordinates.
+        renderer: Renderer to measure against.
+        pad: Half-width of the halo, in display pixels.
+
+    Returns:
+        The halo box.
+    """
+    ann.update_positions(renderer)
+    x, y = ann.axes.transData.transform(ann.xy)
+    return mpl.transforms.Bbox.from_extents(x - pad, y - pad, x + pad, y + pad)
+
+
+#: Vertical rungs a label may be offset to, in typographic points, nearest
+#: first and alternating above and below its point. The step is about 6 pt --
+#: under one line of the 7 pt face these labels are set in -- so a label can
+#: slide into a gap rather than having to clear a whole line, which is what
+#: leaves slivers of one name showing through another.
+_LABEL_RUNGS: Final[tuple[float, ...]] = (
+    4.0,
+    -11.0,
+    10.0,
+    -17.0,
+    16.0,
+    -23.0,
+    22.0,
+    -29.0,
+    28.0,
+    -35.0,
+)
+
+#: Horizontal placements tried at each rung, in preference order: to the right
+#: of the point, to the left of it, then centred over it. A negative ``dx``
+#: draws the label right-aligned so it grows leftwards, and zero centres it.
+#: Sides alternate before heights do, because crowding on a scatter is mostly
+#: horizontal and flipping a label inboard is the only move that keeps a point
+#: near the right spine from throwing its name off the canvas. The centred
+#: variant earns its place by being geometrically different from both: it is
+#: often the only one that clears a neighbour's leader line.
+_LABEL_SIDES: Final[tuple[float, ...]] = (6.0, -6.0, 0.0)
+
+#: Candidate label offsets from the anchor point, in typographic points, in
+#: preference order.
+_LABEL_OFFSETS: Final[tuple[tuple[float, float], ...]] = tuple(
+    (dx, dy) for dy in _LABEL_RUNGS for dx in _LABEL_SIDES
+)
+
+
+def _align(dx: float) -> str:
+    """Horizontal alignment implied by a candidate's x offset.
+
+    Args:
+        dx: Offset in points; positive grows right, negative left, zero centres.
+
+    Returns:
+        A matplotlib horizontal alignment.
+    """
+    if dx > 0.0:
+        return "left"
+    return "right" if dx < 0.0 else "center"
+
+
+#: Displacement, in points, past which a label has visibly left its own marker
+#: and is given a leader line back to it. Sits above the whole first rung and
+#: below the second, so a label at its preferred offset gets no line and one
+#: that had to be moved always does.
+_LEADER_AT: Final[float] = 12.0
+
+#: Weight on escaped area relative to overlapped area when ranking placements.
+#: Escaping is the worse failure and is counted double: a label outside the
+#: axes is both unattributable to any marker AND, under ``bbox_inches="tight"``,
+#: expands the saved canvas and throws the title off-centre. One defect, two
+#: symptoms.
+_SPILL_WEIGHT: Final[float] = 2.0
+
+#: Clearance, in points, kept around a fixed obstacle. Sized to the plate the
+#: correlation note is drawn on: its rounded frame sits about 2.5 pt outside
+#: the glyphs it was measured from.
+_FIXED_PAD: Final[float] = 3.0
+
+#: Clearance, in points, kept around a label already placed. Without it two
+#: names whose anchors differ by a few pixels settle a hair apart and a sliver
+#: of one prints through the descenders of the other.
+_LABEL_PAD: Final[float] = 1.5
+
+#: Half-width, in points, of the keep-out box round a labelled marker. The
+#: season scatter's largest dot is 82 pt of area, so a radius near 5 pt, and
+#: the accent ring adds its linewidth on top.
+_MARKER_HALO: Final[float] = 6.0
+
+#: Weight on a leader line crossing text, relative to glyphs overprinting
+#: glyphs. The cost is the struck length times the line height, i.e. the block
+#: of text the leader runs across; halved because a name with a hairline
+#: through it is still readable and a name under another name is not.
+_LEADER_WEIGHT: Final[float] = 0.5
+
+
+def _declutter(
+    fig: Figure,
+    annotations: Sequence[Any],
+    *,
+    fixed: Sequence[Any] = (),
+    inside: Axes | None = None,
+) -> None:
+    """Place point labels so they overlap nothing and stay inside the frame.
+
+    Each label is tried at :data:`_LABEL_OFFSETS` in order and takes the first
+    placement that costs nothing; if none is clean it takes the cheapest. The
+    cost of a placement is the area of glyphs it would overprint, plus the area
+    that would fall outside ``inside`` (weighted by :data:`_SPILL_WEIGHT`), plus
+    the block of text its own leader line would strike through and the block of
+    its own text that other leaders would strike (both weighted by
+    :data:`_LEADER_WEIGHT`). Everything is an area in square display pixels, so
+    the terms are commensurate and the ranking means something when no
+    placement is clean.
+
+    Four things count as obstacles: annotations in ``fixed``, labels already
+    placed, the leaders already drawn, and every labelled marker other than the
+    one being placed -- a ringed outlier buried under a different player's name
+    is as unattributable as a label with no leader at all.
+
+    Anything that ends up further than :data:`_LEADER_AT` from its anchor gets
+    its leader line switched on, so a label that had to move is still tied to a
+    marker.
+
+    The predecessor only pushed labels straight down, never sideways, never
+    checked the axes edge, and drew no leaders -- which put three names off the
+    right of the season scatter with nothing tying them to a point. It also
+    never saw the correlation note, which is why a player label printed straight
+    through the one statistic that chart exists to carry. That note now goes in
+    ``fixed``; anything a label must not touch belongs there, not outside the
+    collision set.
+
+    Offsets are set in typographic points, not pixels, so a placement survives
+    being re-rendered at a different dpi.
 
     Args:
         fig: Figure the annotations belong to.
-        annotations: Annotations in placement priority order.
-        max_steps: How many times one label may be pushed down.
+        annotations: Movable annotations, in placement priority order.
+        fixed: Annotations that block space but are never moved. Placed first.
+        inside: Axes every label should stay within. Measured after the trial
+            draw, so it reflects the final layout. None disables the test.
     """
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
-    placed: list[Any] = []
-    to_points = 72.0 / float(fig.dpi)
-    for ann in annotations:
-        box = ann.get_window_extent(renderer=renderer)
-        for _ in range(max_steps):
-            if not any(box.overlaps(other) for other in placed):
+    bounds = None if inside is None else inside.get_window_extent(renderer=renderer)
+    scale = float(fig.dpi) / 72.0
+    # Fixed obstacles are grown by a hair. A boxed note measures to its glyphs,
+    # not to the frame drawn round them, so a label placed flush against the
+    # measured box still lands on the border.
+    plates = [_text_box(ann, renderer).padded(_FIXED_PAD * scale) for ann in fixed]
+    # Two views of the same obstacles. `blocked` is padded and prices glyphs
+    # landing on glyphs, where a couple of points of air is the difference
+    # between "separate labels" and "cramped". `inked` is the bare glyph extent
+    # and prices leader lines, because a hairline passing 2 pt clear of a name
+    # is simply not touching it -- charging it against the padded box is what
+    # made the engine reject an otherwise perfect placement and take a real
+    # strikethrough instead.
+    blocked, inked = list(plates), list(plates)
+    halos = [_anchor_halo(ann, renderer, _MARKER_HALO * scale) for ann in annotations]
+    leaders: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for index, ann in enumerate(annotations):
+        others = blocked + [halo for j, halo in enumerate(halos) if j != index]
+        anchor = _centre(halos[index])
+        best_cost = math.inf
+        best: tuple[float, float] = _LABEL_OFFSETS[0]
+        for offset in _LABEL_OFFSETS:
+            ann.set_position(offset)
+            ann.set_ha(_align(offset[0]))
+            box = _text_box(ann, renderer)
+            cost = sum(_overlap_area(box, other) for other in others)
+            cost += _SPILL_WEIGHT * _spill_area(box, bounds)
+            # Leaders run from the box CENTRE, not from the edge facing the
+            # point: ``Annotation`` builds its arrow from ``relpos``, which
+            # defaults to (0.5, 0.5), then clips it against the text rectangle,
+            # so the visible line is a segment of the ray leaving the centre
+            # and the ray is what a candidate has to be priced on. Pricing from
+            # the near edge understates it badly -- it turned an 8 px graze of
+            # a neighbour's name into a 52 px strikethrough, because the search
+            # was scoring a line nobody was going to draw. Charged against text
+            # only, never against the bare marker halos: a leader running past
+            # a dot is fine, one running through a name is not.
+            mine = (_centre(box), anchor)
+            cost += _LEADER_WEIGHT * sum(
+                _segment_in_box(*mine, other) * other.height for other in inked
+            )
+            cost += _LEADER_WEIGHT * sum(
+                _segment_in_box(*seg, box) * box.height for seg in leaders
+            )
+            if cost <= 0.0:
+                best, best_cost = offset, 0.0
                 break
-            dx, dy = ann.get_position()
-            ann.set_position((dx, dy - box.height * to_points - 1.5))
-            box = ann.get_window_extent(renderer=renderer)
-        placed.append(box)
+            if cost < best_cost:
+                best, best_cost = offset, cost
+        ann.set_position(best)
+        ann.set_ha(_align(best[0]))
+        box = _text_box(ann, renderer)
+        blocked.append(box.padded(_LABEL_PAD * scale))
+        inked.append(box)
+        arrow = getattr(ann, "arrow_patch", None)
+        if arrow is not None:
+            drawn = math.hypot(*best) > _LEADER_AT
+            arrow.set_visible(drawn)
+            if drawn:
+                leaders.append((_centre(box), anchor))
 
 
 def _empty(ax: Axes, message: str) -> None:
@@ -2567,6 +2979,43 @@ SEASON_COLUMNS: Final[tuple[str, ...]] = (
     "team",
 )
 
+#: Two-sided 95% normal quantile, for the Fisher-z interval on a correlation.
+#: Hard-coded rather than taken from scipy: this module has no scipy dependency
+#: and one constant is not worth acquiring one.
+_Z_95: Final[float] = 1.959963984540054
+
+#: Extra y range, as a fraction of the autoscaled range, opened above the cloud
+#: when outliers are labelled. Every point worth labelling is an extreme, so
+#: without a clear band above them the labelled names have nowhere to go and
+#: the placement search has to trade one defect for another. On the La Liga
+#: 2015/2016 table this is the difference between four of the six names needing
+#: a leader line and one of them needing one.
+_LABEL_HEADROOM: Final[float] = 0.18
+
+
+def _pearson_ci(r: float, n: int) -> tuple[float, float]:
+    """Fisher-z 95% confidence interval for a Pearson correlation.
+
+    A correlation printed bare is not a readable statistic. The season scatter's
+    whole finding is that the relationship is indistinguishable from nothing,
+    and the only mark on the chart that can say so is an interval straddling
+    zero -- without it a reader cannot tell a measured null from a sample too
+    small to have measured anything.
+
+    Args:
+        r: Sample correlation.
+        n: Number of pairs behind it.
+
+    Returns:
+        ``(low, high)``. Both are NaN when ``n`` is under 4 or ``|r|`` is 1,
+        where the transform has no finite standard error.
+    """
+    if n < 4 or not np.isfinite(r) or abs(r) >= 1.0:
+        return float("nan"), float("nan")
+    half = _Z_95 / math.sqrt(n - 3)
+    z = math.atanh(r)
+    return math.tanh(z - half), math.tanh(z + half)
+
 
 def season_scatter(
     season: pd.DataFrame,
@@ -2653,6 +3102,7 @@ def season_scatter(
         log_values = np.log10(values)
         fitted = False
         note = ""
+        plate: Any = None
         if values.size >= 3 and np.unique(log_values).size >= 2:
             slope, intercept = np.polyfit(log_values, metric, 1)
             grid = np.linspace(log_values.min(), log_values.max(), 64)
@@ -2668,7 +3118,34 @@ def season_scatter(
             residual = metric - (slope * log_values + intercept)
             if np.std(log_values) > 0 and np.std(metric) > 0:
                 r = float(np.corrcoef(log_values, metric)[0, 1])
-                note = f"r = {r:+.2f} against log₁₀ value"
+                note = f"r = {r:+.2f} against log₁₀ value  (n = {values.size})"
+                low, high = _pearson_ci(r, int(values.size))
+                if np.isfinite(low):
+                    note += f"\n95% CI {low:+.2f} to {high:+.2f}"
+                # Drawn BEFORE the labels, so it can be handed to _declutter as
+                # a fixed obstacle. It used to be drawn last and left out of the
+                # collision set entirely, and a player name printed straight
+                # through it -- the one statistic the chart exists to carry.
+                # The plate is opaque for the same reason: a gridline or a
+                # trend line crossing a minus sign is enough to lose it.
+                plate = ax.annotate(
+                    note,
+                    xy=(1.0, 1.0),
+                    xycoords="axes fraction",
+                    xytext=(-4, -4),
+                    textcoords="offset points",
+                    ha="right",
+                    va="top",
+                    fontsize=TICK_SIZE,
+                    color=INK,
+                    zorder=7.0,
+                    bbox={
+                        "boxstyle": "round,pad=0.34",
+                        "facecolor": SURFACE,
+                        "edgecolor": _mix(INK_MUTED, SURFACE, 0.45),
+                        "linewidth": HAIRLINE,
+                    },
+                )
             worst = np.argsort(-np.abs(residual))[: max(int(n_labels), 0)]
             if worst.size and label_col in table.columns:
                 ax.scatter(
@@ -2680,6 +3157,14 @@ def season_scatter(
                     linewidths=1.4,
                     zorder=5.0,
                 )
+                # Headroom before anything is placed. Every point worth
+                # labelling is an extreme, so the labelled six cluster along
+                # the top of the cloud with nowhere for a name to go; without
+                # this the placement engine spends its whole ladder and still
+                # has to route a leader across somebody else's label.
+                ax.autoscale_view()
+                floor, ceiling = ax.get_ylim()
+                ax.set_ylim(floor, ceiling + _LABEL_HEADROOM * (ceiling - floor))
                 labels = []
                 for i in worst:
                     name = str(table.loc[i, label_col])
@@ -2694,22 +3179,25 @@ def season_scatter(
                             fontsize=TICK_SIZE - 0.5,
                             color=INK,
                             zorder=6.0,
+                            # Every label carries a leader line from the outset
+                            # and _declutter switches it off again for the ones
+                            # that never had to move. A label cannot acquire an
+                            # arrow after construction, so the cheap thing is to
+                            # give them all one and hide most of them.
+                            arrowprops={
+                                "arrowstyle": "-",
+                                "linewidth": 0.6,
+                                "color": INK_MUTED,
+                                "shrinkA": 1.0,
+                                "shrinkB": 3.0,
+                            },
                         )
                     )
-                _declutter(fig, labels)
-
-        if note:
-            ax.annotate(
-                note,
-                xy=(1.0, 1.0),
-                xycoords="axes fraction",
-                xytext=(-2, -2),
-                textcoords="offset points",
-                ha="right",
-                va="top",
-                fontsize=TICK_SIZE,
-                color=INK_SOFT,
-            )
+                # The note is the one number this chart exists to print, so it
+                # is placed first and never moved; the labels route around it.
+                _declutter(
+                    fig, labels, fixed=[plate] if plate is not None else [], inside=ax
+                )
 
         if caption is None:
             unit = "player" if len(table) == 1 else "players"
