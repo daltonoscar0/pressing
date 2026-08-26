@@ -9,6 +9,7 @@ coordinates and this project's canonical bottom-left 105 x 68 metre ones.
 
 from __future__ import annotations
 
+import hashlib
 from itertools import pairwise
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from pressing.pitchcontrol import REFERENCE_FIELD_DIMEN, to_reference_frame
 PITCH_L = 105.0
 PITCH_W = 68.0
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VENDORED_REFERENCE = REPO_ROOT / "validation" / "reference" / "Metrica_EPV.py"
 
 
 # --------------------------------------------------------------------------- #
@@ -50,9 +52,9 @@ def _reference_get_epv_at_location(
     From https://github.com/Friends-of-Tracking-Data-FoTD/LaurieOnTracking,
     commit 7ed3ff857940d3f4611be55f3c08c79525c32171, MIT licence, Copyright
     (c) 2021 Friends-of-Tracking-Data-FoTD. Transcribed rather than imported so
-    this test runs on a fresh clone: the vendored copy under ``data/raw/`` is
-    gitignored. ``test_transcription_matches_the_vendored_reference`` checks
-    the transcription against the real file whenever that file is present.
+    the tests do not depend on the reference's own imports.
+    ``test_transcription_matches_the_vendored_reference`` cross-checks it
+    against the committed copy under ``validation/reference/``.
     """
     x, y = position
     if abs(x) > field_dimen[0] / 2.0 or abs(y) > field_dimen[1] / 2.0:
@@ -68,10 +70,16 @@ def _reference_get_epv_at_location(
 
 
 def test_transcription_matches_the_vendored_reference() -> None:
-    """Cross-check the transcription above against the cached upstream file."""
-    vendored = REPO_ROOT / "data" / "raw" / "reference" / "Metrica_EPV.py"
-    if not vendored.is_file():
-        pytest.skip("vendored reference not present (data/raw/ is not committed)")
+    """Cross-check the transcription above against the committed upstream file.
+
+    The copy under ``validation/reference/`` is tracked and its sha256 is
+    pinned in ``validation/reference/MANIFEST.sha256``, so this runs on a fresh
+    clone. It used to read ``data/raw/reference/``, which is gitignored, and so
+    it skipped everywhere except on a machine that had already downloaded the
+    reference.
+    """
+    vendored = VENDORED_REFERENCE
+    assert vendored.is_file(), f"{vendored} is committed and must be present"
     source = vendored.read_text()
     start = source.index("def get_EPV_at_location")
     body = source[start : source.index("\ndef ", start + 1)]
@@ -86,6 +94,17 @@ def test_transcription_matches_the_vendored_reference() -> None:
             assert _reference_get_epv_at_location(pos, grid, direction) == pytest.approx(
                 float(upstream(pos, grid, direction))
             )
+
+
+def test_the_committed_reference_matches_its_manifest() -> None:
+    """The cross-check above is only worth anything if the copy is untouched."""
+    manifest = VENDORED_REFERENCE.parent / "MANIFEST.sha256"
+    pinned = {
+        name: digest
+        for digest, name in (line.split() for line in manifest.read_text().splitlines() if line)
+    }
+    digest = hashlib.sha256(VENDORED_REFERENCE.read_bytes()).hexdigest()
+    assert digest == pinned[VENDORED_REFERENCE.name]
 
 
 # --------------------------------------------------------------------------- #
