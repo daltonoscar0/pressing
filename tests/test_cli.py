@@ -223,7 +223,17 @@ class _Recorder:
 
         self.out = out
         self.kwargs = kwargs
-        return DemoResult(pdf=Path(out), n_losses=256, n_scored=255, jobs=6, seconds=11.9)
+        return DemoResult(
+            pdf=Path(out),
+            n_losses=256,
+            n_scored=255,
+            jobs=6,
+            seconds=11.9,
+            process_seconds=17.4,
+            cpu_seconds=48.6,
+            load_start=1.25,
+            load_end=3.5,
+        )
 
 
 @pytest.fixture()
@@ -301,6 +311,87 @@ def test_demo_rejects_zero_jobs(recorder: _Recorder) -> None:
     result = _run("demo", "--jobs", "0")
     assert result.exit_code != 0
     assert recorder.kwargs == {}
+
+
+def test_demo_leaves_the_worker_count_to_run_demo(recorder: _Recorder) -> None:
+    """One place decides it, and the CLI is not that place.
+
+    ``--jobs`` unset arrives at :func:`pressing.demo.run_demo` as None, which is
+    what lets the load reading and the count that came out of it be recorded on
+    the same result object the run reports from.
+    """
+    assert _run("demo").exit_code == 0
+    assert recorder.kwargs["jobs"] is None
+
+
+def test_demo_never_prints_the_pipeline_clock_by_itself(recorder: _Recorder) -> None:
+    """The reported cost must not be readable as an end-to-end number.
+
+    The stub returns 11.9 s of pipeline clock against 17.4 s since import and
+    48.6 s of CPU. Printing the first alone -- which is what this command used
+    to do -- understates the command by more than the number it prints.
+    """
+    result = _run("demo")
+    assert result.exit_code == 0
+    assert "11.9s in the pipeline" in result.output
+    assert "17.4s wall clock since import" in result.output
+    assert "48.6s CPU including imports and workers" in result.output
+    assert "1-min load average 1.25 -> 3.50" in result.output
+    assert "interpreter start-up is in neither" in result.output
+
+
+def test_demo_says_where_the_worker_count_came_from(recorder: _Recorder) -> None:
+    """A count that moves between runs looks like a bug unless the run says why."""
+    result = _run("demo")
+    assert "6 worker(s) (adaptive)" in result.output
+
+
+def test_report_falls_back_to_serial_on_a_saturated_machine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``report`` shares the policy, and shows the measurement behind it."""
+    seen: dict[str, Any] = {}
+
+    monkeypatch.setattr("pressing.cli._load_match", lambda t, e: ("TRACKING", "EVENTS"))
+    monkeypatch.setattr("pressing.report.build_report", lambda *a, **k: Path(a[3]))
+    monkeypatch.setattr(pressing, "cpu_availability", lambda *a, **k: 0.35)
+
+    def fake_score(*args: Any, **kwargs: Any) -> Any:
+        seen["jobs"] = kwargs.get("jobs")
+        import pandas as pd
+
+        return pd.DataFrame({"scored": [True]})
+
+    monkeypatch.setattr("pressing.counterpress.score_losses", fake_score)
+
+    result = _run("report", str(tmp_path), "--team", "home", "--out", str(tmp_path / "r.pdf"))
+    assert result.exit_code == 0, result.output
+    assert seen["jobs"] == 1
+    assert "1 worker(s) (adaptive, CPU share 0.35)" in result.output
+
+
+def test_report_uses_the_full_cap_when_a_core_is_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other side of the same switch, so neither branch is untested."""
+    seen: dict[str, Any] = {}
+
+    monkeypatch.setattr("pressing.cli._load_match", lambda t, e: ("TRACKING", "EVENTS"))
+    monkeypatch.setattr("pressing.report.build_report", lambda *a, **k: Path(a[3]))
+    monkeypatch.setattr(pressing, "cpu_availability", lambda *a, **k: 0.96)
+
+    def fake_score(*args: Any, **kwargs: Any) -> Any:
+        seen["jobs"] = kwargs.get("jobs")
+        import pandas as pd
+
+        return pd.DataFrame({"scored": [True]})
+
+    monkeypatch.setattr("pressing.counterpress.score_losses", fake_score)
+
+    result = _run("report", str(tmp_path), "--team", "home", "--out", str(tmp_path / "r.pdf"))
+    assert result.exit_code == 0, result.output
+    assert seen["jobs"] == pressing.adaptive_jobs(availability=0.96)
+    assert "CPU share 0.96" in result.output
 
 
 # --------------------------------------------------------------------------- #

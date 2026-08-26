@@ -28,6 +28,15 @@ not read like one.
 Exit codes: 0 success, 1 the run could not proceed, 2 a usage error (click's,
 not ours -- a bad flag), 3 the feature is not built.
 
+``--jobs`` is left unset by default and the tool measures the machine instead:
+see :func:`pressing.adaptive_jobs` for the policy and the runs behind it. Every
+line that reports a worker count also reports the measurement that produced it,
+because a number that moves between two runs of the same command on the same
+machine reads as a bug unless the command says what moved it. For the same
+reason ``demo`` never prints its pipeline clock on its own -- that clock cannot
+see the imports, which on a loaded machine have been measured at 70 s of a
+150 s command -- so it prints wall clock, CPU and the load average together.
+
 Imports here are lazy on purpose. Every analysis module pulls in matplotlib,
 pandas and reportlab -- several seconds of import even warm -- and ``pressing
 --help`` and ``pressing --version`` have no business paying for any of it. The
@@ -109,6 +118,24 @@ def _echo(message: str) -> None:
     typer.secho(message, err=True)
 
 
+def _adaptive_note(share: float | None) -> str:
+    """Say why the tool chose the worker count it chose.
+
+    A worker count that moves between runs on the same machine looks like a bug
+    unless the run says what moved it, so the measurement behind it is printed
+    alongside it.
+
+    Args:
+        share: Measured share of one core, or None if nothing was measured.
+
+    Returns:
+        A short parenthetical.
+    """
+    if share is None:
+        return "adaptive"
+    return f"adaptive, CPU share {share:.2f}"
+
+
 def _version_callback(value: bool) -> None:
     """Print the version and exit when ``--version`` is passed.
 
@@ -149,8 +176,11 @@ JobsOption = Annotated[
         "-j",
         min=1,
         help=(
-            "Worker processes for scoring. Defaults to min(6, cpu count). "
-            "Use --jobs 1 for the serial path; the scores are identical."
+            "Worker processes for scoring. Left alone, the tool measures what "
+            "share of a core this machine is giving it and uses min(6, cpu "
+            "count) workers when there is a core to spare, or the serial path "
+            "when there is not. An explicit value always wins, including "
+            "--jobs 1. The scores are identical at any worker count."
         ),
     ),
 ]
@@ -324,17 +354,23 @@ def report(
 
     import pressing
 
+    # Probed before the font-cache child is started, not after: on a cold cache
+    # that child is a busy CPU of our own making, and a probe that saw it would
+    # read the machine as saturated and drop us to the serial path for it.
+    share = pressing.cpu_availability() if jobs is None else None
+    workers = int(jobs) if jobs is not None else pressing.adaptive_jobs(availability=share)
+
     warm = pressing.warm_matplotlib_cache()
 
-    from pressing.counterpress import default_jobs, score_losses
+    from pressing.counterpress import score_losses
 
-    workers = default_jobs() if jobs is None else int(jobs)
     frames, event_frame = _load_match(tracking, events)
     _echo(f"loaded {len(frames):,} tracking rows and {len(event_frame):,} events")
 
     losses = score_losses(frames, event_frame, jobs=workers)
     scored = int(losses["scored"].fillna(False).astype(bool).sum())
-    _echo(f"scored {scored} of {len(losses)} possession losses on {workers} worker(s)")
+    why = "--jobs" if jobs is not None else _adaptive_note(share)
+    _echo(f"scored {scored} of {len(losses)} possession losses on {workers} worker(s) ({why})")
 
     if warm is not None:
         warm.wait()
@@ -575,9 +611,11 @@ def demo(
         _fail(str(exc))
 
     _echo(
-        f"done in {result.seconds:.1f}s wall clock — {result.n_scored} of "
-        f"{result.n_losses} losses scored on {result.jobs} worker(s)"
+        f"{result.n_scored} of {result.n_losses} losses scored on "
+        f"{result.jobs} worker(s) ({result.jobs_source})"
     )
+    # Never the pipeline clock on its own. See DemoResult.cost_line for why.
+    _echo(f"cost: {result.cost_line()}")
     typer.echo(str(result.pdf))
 
 

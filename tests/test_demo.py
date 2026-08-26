@@ -23,6 +23,8 @@ from typing import Any
 import pandas as pd
 import pytest
 
+import pressing
+from pressing import SATURATED_CPU_SHARE, adaptive_jobs, cpu_availability, load_average
 from pressing.demo import (
     DEMO_DIR,
     DEMO_GAME,
@@ -285,6 +287,226 @@ def test_run_demo_reports_what_it_did(demo_run: Any) -> None:
     assert sum(demo_run.timings.values()) <= demo_run.seconds + 1e-6
 
 
+# --------------------------------------------------------------------------- #
+# The worker count, and the measurement behind it
+# --------------------------------------------------------------------------- #
+
+
+def _stub_pipeline(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Replace everything expensive in ``run_demo`` and record what it was asked.
+
+    The tests below are about the worker-count decision and the cost report,
+    neither of which needs a real match, a real score or a real PDF. The one
+    thing that must stay real is ``run_demo``'s own control flow.
+
+    Args:
+        monkeypatch: Fixture.
+
+    Returns:
+        A dict that gains a ``"jobs"`` key when scoring is called.
+    """
+    import pressing.report as report_module
+
+    seen: dict[str, Any] = {}
+
+    def spy_score(*args: Any, **kwargs: Any) -> pd.DataFrame:
+        seen["jobs"] = kwargs.get("jobs")
+        return _stub_losses()
+
+    monkeypatch.setattr(
+        "pressing.demo.load_demo_match", lambda *a, **k: (_stub_tracking(), _stub_events())
+    )
+    monkeypatch.setattr("pressing.counterpress.score_losses", spy_score)
+    monkeypatch.setattr(report_module, "render_moments", lambda *a, **k: [])
+    monkeypatch.setattr(report_module, "build_report", lambda *a, **k: Path(a[3]))
+    return seen
+
+
+def test_adaptive_jobs_never_leaves_its_bounds() -> None:
+    """Whatever the probe returns, the answer is a usable worker count."""
+    for share in (0.0, 0.01, 0.34, 0.58, SATURATED_CPU_SHARE, 0.95, 1.0):
+        assert 1 <= adaptive_jobs(cap=6, availability=share) <= 6
+    assert adaptive_jobs(cap=1, availability=1.0) == 1
+
+
+def test_adaptive_jobs_is_the_old_fixed_default_when_a_core_is_free() -> None:
+    """Nothing changes where nothing needed to change."""
+    from pressing.counterpress import default_jobs
+
+    assert adaptive_jobs(availability=1.0) == default_jobs()
+    # 0.94 was measured on the box where six workers beat serial by 2-3x.
+    assert adaptive_jobs(availability=0.94) == default_jobs()
+
+
+def test_adaptive_jobs_falls_to_the_serial_path_on_a_saturated_machine() -> None:
+    """Both shares here are measured, and serial won the run at each of them.
+
+    0.31-0.58 came from eight CPU burners, where serial scored the match 2.4x
+    faster; 0.73 came from twenty-four, where the whole command was 215.7 s
+    serial against 275.8 s on six workers.
+    """
+    assert adaptive_jobs(cap=6, availability=0.34) == 1
+    assert adaptive_jobs(cap=6, availability=0.58) == 1
+    assert adaptive_jobs(cap=6, availability=0.73) == 1
+
+
+def test_the_threshold_sits_between_the_two_measured_regimes() -> None:
+    """It is a midpoint of ignorance, and it must stay inside what was measured.
+
+    Serial won at 0.73 and the cap won at 0.94. A constant that drifted outside
+    that bracket would be contradicting a measurement rather than interpolating
+    between two.
+    """
+    assert 0.73 < SATURATED_CPU_SHARE < 0.94
+
+
+def test_adaptive_jobs_does_not_probe_an_idle_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A machine with under one runnable thread cannot be saturated.
+
+    Skipping the probe there is what keeps its 0.24 s off the common path, and
+    it is only safe because the short-circuit can only ever answer "the cap".
+    """
+    monkeypatch.setattr(
+        pressing, "cpu_availability", lambda *a, **k: pytest.fail("probed an idle box")
+    )
+    assert adaptive_jobs(cap=6, load=0.4) == 6
+
+
+def test_adaptive_jobs_probes_when_the_load_average_says_it_might_matter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And the probe, not the load average, is what decides.
+
+    The load average is passed a value that under the policy this replaced
+    would have forced the serial path outright.
+    """
+    monkeypatch.setattr(pressing, "cpu_availability", lambda *a, **k: 0.97)
+    assert adaptive_jobs(cap=6, load=40.0) == 6
+
+    monkeypatch.setattr(pressing, "cpu_availability", lambda *a, **k: 0.40)
+    assert adaptive_jobs(cap=6, load=40.0) == 1
+
+
+def test_the_probe_returns_a_share_of_one_core() -> None:
+    """Run for real, on whatever machine the suite is on."""
+    share = cpu_availability(samples=2, seconds=0.02)
+    assert 0.0 < share <= 1.0
+
+
+def test_explicit_jobs_beats_the_policy_however_loaded_the_machine_is(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--jobs`` is an override, not a hint, and it skips the probe entirely."""
+    seen = _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "pressing.demo.cpu_availability", lambda *a, **k: pytest.fail("probed anyway")
+    )
+
+    result = run_demo(tmp_path / "r.pdf", jobs=4)
+    assert seen["jobs"] == 4
+    assert result.jobs == 4
+    assert result.jobs_source == "--jobs"
+    assert result.cpu_share is None
+
+
+def test_jobs_one_is_never_second_guessed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The serial path is a supported choice; an idle machine must not widen it."""
+    seen = _stub_pipeline(monkeypatch)
+    monkeypatch.setattr("pressing.demo.cpu_availability", lambda *a, **k: 1.0)
+
+    result = run_demo(tmp_path / "r.pdf", jobs=1)
+    assert seen["jobs"] == 1
+    assert result.jobs == 1
+    assert result.jobs_source == "--jobs"
+
+
+def test_the_default_worker_count_follows_the_measured_cpu_share(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same call, same machine, two measured shares, two worker counts."""
+    seen = _stub_pipeline(monkeypatch)
+
+    monkeypatch.setattr("pressing.demo.cpu_availability", lambda *a, **k: 0.95)
+    free = run_demo(tmp_path / "free.pdf")
+    assert seen["jobs"] == free.jobs == adaptive_jobs(availability=0.95)
+    assert free.cpu_share == 0.95
+
+    monkeypatch.setattr("pressing.demo.cpu_availability", lambda *a, **k: 0.35)
+    busy = run_demo(tmp_path / "busy.pdf")
+    assert seen["jobs"] == busy.jobs == 1
+    assert busy.cpu_share == 0.35
+
+    assert free.jobs_source == busy.jobs_source == "adaptive"
+
+
+def test_the_run_records_the_load_it_ran_under(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A wall clock without the load it was taken at is not evidence of anything."""
+    _stub_pipeline(monkeypatch)
+    result = run_demo(tmp_path / "r.pdf", jobs=1)
+
+    # None only where the platform has no load average at all, and then both.
+    assert (result.load_start is None) == (load_average() is None)
+    assert (result.load_end is None) == (load_average() is None)
+    if result.load_start is not None:
+        assert result.load_start >= 0.0
+
+
+# --------------------------------------------------------------------------- #
+# The cost the tool reports for itself
+# --------------------------------------------------------------------------- #
+
+
+def test_the_pipeline_clock_is_never_reported_on_its_own(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The whole point of ``cost_line``: the small number cannot stand alone.
+
+    ``DemoResult.seconds`` structurally excludes the imports, and on a cold
+    clone those have been measured as the larger half of the command. A line
+    that printed it by itself would read as an end-to-end cost.
+    """
+    _stub_pipeline(monkeypatch)
+    result = run_demo(tmp_path / "r.pdf", jobs=1)
+    line = result.cost_line()
+
+    assert "wall clock since import" in line
+    assert f"{result.seconds:.1f}s in the pipeline" in line
+    assert "interpreter start-up is in neither" in line
+    assert "CPU" in line
+    assert "load average" in line
+
+
+def test_the_reported_process_clock_is_bigger_than_the_pipeline_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """And the gap is exactly the thing the old number could not see."""
+    _stub_pipeline(monkeypatch)
+    result = run_demo(tmp_path / "r.pdf", jobs=1)
+
+    assert result.process_seconds > result.seconds >= 0.0
+
+
+def test_the_reported_cpu_covers_the_imports_the_stage_clock_missed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``getrusage`` counts from ``exec``, so numpy and pandas are already in it.
+
+    With the pipeline stubbed out to nothing, any CPU at all can only have come
+    from before ``run_demo`` was entered.
+    """
+    _stub_pipeline(monkeypatch)
+    result = run_demo(tmp_path / "r.pdf", jobs=1)
+
+    assert result.cpu_seconds is not None
+    assert result.cpu_seconds > result.seconds
+
+
 def test_run_demo_reports_the_epv_and_metrica_credit(demo_run: Any) -> None:
     """The credit Metrica asks for has to survive into the artefact."""
     if shutil.which("pdftotext") is None:
@@ -332,6 +554,33 @@ def test_run_demo_does_not_read_data_raw(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(Path, "open", guarded)
     tracking, events = load_demo_match()
     assert len(tracking) > 0 and len(events) > 0
+
+
+def test_the_scores_do_not_depend_on_the_worker_count(
+    match: tuple[pd.DataFrame, pd.DataFrame],
+) -> None:
+    """Load-bearing in a way it was not before the default became adaptive.
+
+    Two runs of ``pressing demo`` on the same machine ten minutes apart can now
+    legitimately choose different worker counts, so worker count has to be
+    invisible in the output or the report stops being reproducible.
+
+    Exact equality, not ``approx``: both paths do the same float64 arithmetic
+    on the same windows, and a difference could only come from how the losses
+    were divided between workers. A quarter of the real match, spread evenly
+    over it, so the split is genuinely uneven across four workers.
+    """
+    from pressing.counterpress import find_possession_losses, score_losses
+
+    tracking, events = match
+    losses = find_possession_losses(tracking, events).iloc[::4].reset_index(drop=True)
+    assert len(losses) > 50
+
+    serial = score_losses(tracking, events, losses=losses, jobs=1)
+    parallel = score_losses(tracking, events, losses=losses, jobs=4)
+
+    assert serial["scored"].fillna(False).astype(bool).sum() > 50
+    pd.testing.assert_frame_equal(serial, parallel, check_exact=True)
 
 
 # --------------------------------------------------------------------------- #

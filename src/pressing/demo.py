@@ -51,25 +51,85 @@ all outbound network refused in-process, timed end to end with
 
 Inside the two-minute budget, with about 24 s of headroom -- not more.
 
-The gap between the two columns is the point, and it is a trap for anyone
-quoting the number this module prints. :class:`DemoResult` reports wall clock
-over the work :func:`run_demo` does, and it cannot report what happened before
-it was called: the interpreter starting and ``import pressing.demo`` pulling in
-numpy, pandas, pyarrow, matplotlib and reportlab. On a genuinely cold clone
-that import measured 65.5 s against 5.18 s of user CPU -- almost pure disk
-wait, reading shared objects that were written minutes earlier and never read.
-Warm it is 4.8 s. It is the single largest fresh-clone cost, it is larger than
-the font scan, and it is not something this module can overlap with anything,
-because nothing has started yet.
+The gap between the two columns is the point, and it used to be a trap for
+anyone quoting the number this module printed. ``run_demo``'s stage clock
+starts when the work starts, so it structurally cannot see what happened
+before it was called: the interpreter starting and ``import pressing.demo``
+pulling in numpy, pandas, pyarrow, matplotlib and reportlab. On a genuinely
+cold clone that import was measured at 65.5 s against 5.18 s of user CPU --
+almost pure disk wait, reading shared objects that were written minutes
+earlier and never read. It is the single largest fresh-clone cost, it is
+larger than the font scan, and it is not something this module can overlap
+with anything, because nothing has started yet.
 
-So there are two honest numbers and they differ by a factor of four:
+So the stage clock is never reported on its own. :meth:`DemoResult.cost_line`
+reports four things at once and the CLI prints all four:
 
-* **23.5 s** -- ``run_demo``'s own clock, second run, everything warm. This is
-  the number to quote for the analytics.
-* **95.5 s** -- fresh clone, cold caches, no network, end to end. This is the
-  number the acceptance criterion is about.
+* wall clock since ``import pressing``, which is the first line of this
+  package to run and therefore precedes every heavy import in it;
+* the stage clock inside it, labelled as the part it is;
+* **CPU seconds** for this process and its reaped children, from ``exec``, via
+  :func:`resource.getrusage` -- the only one of the four that is complete and
+  does not move with what else is on the machine;
+* the one-minute load average at the start and at the end, so a wall clock
+  taken on a busy box carries the evidence that it was.
 
-Quoting the first as if it were the second understates the real cost by ~70 s.
+The remaining gap is interpreter start-up and ``import typer``, which run
+before any of this package does. The printed line says so rather than pretending
+otherwise.
+
+What the tool does about a busy machine
+---------------------------------------
+Neither loading nor the font scan is what actually misses the budget. Machine
+load is. The v0.1.0 README records six cold-cache end-to-end runs of this
+command on one laptop on one afternoon at 57.4, 58.9, 60.3, 81.0, 92.7 and
+152.5 s, and an audit of the same command on the same machine later measured
+306 s. The CPU cost barely moved across any of that.
+
+So the worker count is chosen per run rather than fixed. What it is chosen
+*from* was the interesting part, because the obvious signal turned out to be
+useless. Scoring the bundled match at six workers, one fresh process per run::
+
+    one-minute load average 33.99  ->    7.99 s     ambient load only
+    one-minute load average 33.77  ->  108.14 s     the same box, plus eight
+                                                    CPU burners of my own
+
+The same command on the same machine with the same load average to two decimal
+places, 13.5x apart. Worse, the worker count that wins is the opposite one in
+the two conditions: in the first, six workers beat the serial path 7.99 s to
+15.46 s; in the second, the serial path beat six workers 44.56 s to 108.14 s.
+No threshold on the load average can separate those, so the tool does not use
+one to decide.
+
+What does separate them is measuring the thing directly --
+:func:`pressing.cpu_availability` spins for 0.24 s and reports the share of one
+core the scheduler actually hands over. Three readings in each condition,
+minutes apart on the same machine::
+
+    ambient   load average 26.7-27.7   CPU share 0.94-0.96   six workers win
+    burners   load average 28.6-38.0   CPU share 0.31-0.58   serial wins
+
+The load averages overlap; the shares do not come close. So
+:func:`pressing.adaptive_jobs` uses the cap when the share clears
+:data:`pressing.SATURATED_CPU_SHARE` and the serial path when it does not, and
+the load average is kept only for printing next to timings. ``--jobs`` still
+overrides everything, and every worker count produces bit-identical output.
+
+End to end, on a machine loaded until the share read 0.73 -- twenty-four CPU
+burners of mine on top of seven other agents -- ``uv run pressing demo``
+against ``uv run pressing demo --jobs 6``::
+
+    adaptive (chose 1 worker)   real 215.72 s   score 91.0 s    32.6 s CPU
+    --jobs 6                    real 275.81 s   score 149.1 s   45.5 s CPU
+
+1.28x faster end to end, 1.64x on the stage the flag actually controls, for
+72% of the CPU. The adaptive run had the worse machine of the two -- its
+one-minute load average rose from 47 to 84 while the six-worker run's fell
+from 72 to 56 -- so the gap is if anything understated.
+
+The two PDFs are byte-identical apart from ``/CreationDate``, ``/ModDate`` and
+the clock-derived ``/ID``, as is the ``--jobs 1`` run and the six-worker run on
+an unloaded machine: four runs, four worker counts between them, one report.
 
 Which five moments get printed
 ------------------------------
@@ -119,7 +179,14 @@ from typing import TYPE_CHECKING, Any, Final
 import numpy as np
 import pandas as pd
 
-from pressing import warm_matplotlib_cache
+from pressing import (
+    adaptive_jobs,
+    cpu_availability,
+    cpu_seconds,
+    elapsed_since_import,
+    load_average,
+    warm_matplotlib_cache,
+)
 from pressing._io import (
     METRICA_FPS,
     load_metrica_match,
@@ -465,30 +532,86 @@ def load_demo_match(data_dir: Path | str | None = None) -> tuple[pd.DataFrame, p
 class DemoResult:
     """What one demo run produced, and what it cost.
 
+    Four cost numbers, not one, because one number cannot be honest here. The
+    stage clock cannot see the imports; the wall clock cannot be compared
+    across machines or across afternoons on the same machine; only the CPU
+    total is both complete and load-independent. :meth:`cost_line` prints them
+    together and is what the CLI shows.
+
     Attributes:
         pdf: The report written.
         n_losses: Possession losses detected in the match.
         n_scored: Losses the metric could score. The rest keep their row with
             a recorded ``skip_reason``.
         jobs: Worker processes scoring ran on.
+        jobs_source: ``"--jobs"`` when the caller chose the worker count,
+            ``"adaptive"`` when :func:`pressing.adaptive_jobs` did.
+        cpu_share: The measured share of one core the machine was handing this
+            process when the worker count was chosen, or None when the caller
+            chose it and nothing was measured.
         panels_dir: Where ``--all-panels`` wrote, or None.
         n_panels: How many per-loss panels were written.
         timings: Wall clock in seconds per stage, in execution order.
-        seconds: Total wall clock inside :func:`run_demo`. Not the cost of the
+        seconds: Wall clock inside :func:`run_demo`. NOT the cost of the
             command: the interpreter start and the import of numpy, pandas,
             pyarrow, matplotlib and reportlab all happen before this clock
-            starts, and on a cold clone they are the larger half. See the
-            module docstring for both numbers measured side by side.
+            starts, and on a cold clone they are the larger half.
+        process_seconds: Wall clock since ``import pressing``, which is the
+            first line of this package to run and precedes every heavy import
+            in it. Still short of the true process cost by interpreter
+            start-up and ``import typer``.
+        cpu_seconds: User + system CPU for this process and its reaped
+            children -- the scoring pool and the font-cache warmer -- over the
+            whole process including every import. The one figure here that does
+            not move with what else the machine is doing.
+        load_start: One-minute load average when the run began, or None.
+        load_end: One-minute load average when it finished, or None.
     """
 
     pdf: Path
     n_losses: int
     n_scored: int
     jobs: int
+    jobs_source: str = "adaptive"
+    cpu_share: float | None = None
     panels_dir: Path | None = None
     n_panels: int = 0
     timings: dict[str, float] = field(default_factory=dict)
     seconds: float = 0.0
+    process_seconds: float = 0.0
+    cpu_seconds: float | None = None
+    load_start: float | None = None
+    load_end: float | None = None
+
+    def cost_line(self) -> str:
+        """One line stating what the run cost, in terms nobody can misread.
+
+        Three rules it follows, each of which exists because the alternative
+        has already misled someone reading this repo's own numbers:
+
+        * The stage clock is never printed alone, and never without the word
+          that says what it excludes.
+        * CPU time is printed next to it, because CPU is what the work costs
+          and wall clock is what the queue costs, and the two come apart in
+          both directions. The same command measured 23.5 s of wall clock
+          against 49.6 s of CPU with cores to spare, and 215.7 s against 32.6 s
+          on a machine loaded until it would not give one up.
+        * The load average is printed with them, so a wall clock taken on a
+          busy machine carries the evidence that it was.
+
+        Returns:
+            A single line of text.
+        """
+        parts = [
+            f"{self.process_seconds:.1f}s wall clock since import "
+            f"(of which {self.seconds:.1f}s in the pipeline; interpreter "
+            "start-up is in neither)"
+        ]
+        if self.cpu_seconds is not None:
+            parts.append(f"{self.cpu_seconds:.1f}s CPU including imports and workers")
+        if self.load_start is not None and self.load_end is not None:
+            parts.append(f"1-min load average {self.load_start:.2f} -> {self.load_end:.2f}")
+        return ", ".join(parts)
 
 
 #: Default destination, relative to the working directory.
@@ -551,17 +674,27 @@ def run_demo(
     Offline by construction: every input is a committed file, and nothing in
     the path opens a socket.
 
-    The one piece of scheduling here is the matplotlib font cache. Its handle
-    is taken before the data is touched and waited on only when a figure is
-    finally needed, so on a cold cache the scan overlaps loading and scoring
-    instead of adding to them. Waiting is not optional -- importing matplotlib
-    here while the child is still scanning makes both of them do the work.
+    Two pieces of scheduling here, in this order and for a reason.
+
+    First the worker count, when the caller did not pin one: the CPU-share
+    probe runs before anything else this function does, so that nothing of
+    ours -- not the font-cache child, not a loaded dataframe -- is competing
+    with it while it measures what the machine is willing to give us.
+
+    Then the matplotlib font cache. Its handle is taken before the data is
+    touched and waited on only when a figure is finally needed, so on a cold
+    cache the scan overlaps loading and scoring instead of adding to them.
+    Waiting is not optional -- importing matplotlib here while the child is
+    still scanning makes both of them do the work.
 
     Args:
         out_path: Destination PDF. Defaults to ``out/demo_report.pdf``.
-        jobs: Worker processes for scoring. None means
-            :func:`pressing.counterpress.default_jobs`; 1 forces the serial
-            path. The scores are identical either way.
+        jobs: Worker processes for scoring. None means measure what share of a
+            core this machine is handing us and ask
+            :func:`pressing.adaptive_jobs`; any explicit value wins outright,
+            including 1 for the serial path and including a value above the
+            cap. The scores are identical either way -- worker count is a
+            scheduling decision and nothing else.
         team: Team the report is written for.
         rank: Which five losses the moment pages print. Passed to the moment
             builder *and* to the report, because the report captions the pages
@@ -579,9 +712,18 @@ def run_demo(
         A :class:`DemoResult` with the path written and the measured wall
         clock per stage.
     """
-    from pressing.counterpress import default_jobs, score_losses
+    from pressing.counterpress import score_losses
 
-    workers = default_jobs() if jobs is None else int(jobs)
+    load_start = load_average()
+    share: float | None = None
+    if jobs is None:
+        # Probed here, before the font-cache child is started and before any
+        # data is touched, so that the only thing competing for the CPU during
+        # the probe is whatever was already on the machine.
+        share = cpu_availability()
+        workers, jobs_source = adaptive_jobs(availability=share), "adaptive"
+    else:
+        workers, jobs_source = int(jobs), "--jobs"
     destination = Path(out_path) if out_path is not None else DEFAULT_OUT
     clock = _Clock(progress)
 
@@ -595,7 +737,10 @@ def run_demo(
 
     losses = score_losses(tracking, events, jobs=workers)
     n_scored = int(losses["scored"].fillna(False).astype(bool).sum())
-    clock.done("score", f"{len(losses)} losses, {n_scored} scored, jobs={workers}")
+    detail = f"{len(losses)} losses, {n_scored} scored, jobs={workers} ({jobs_source}"
+    if share is not None:
+        detail += f", CPU share {share:.2f}"
+    clock.done("score", detail + ")")
 
     if warm is not None:
         warm.wait()
@@ -625,15 +770,22 @@ def run_demo(
         n_panels = dump_all_panels(tracking, losses, panels_dir, events=events)
         clock.done("all panels", f"{n_panels} PNGs in {panels_dir}")
 
+    cpu = cpu_seconds()
     return DemoResult(
         pdf=destination,
         n_losses=int(len(losses)),
         n_scored=n_scored,
         jobs=workers,
+        jobs_source=jobs_source,
+        cpu_share=share,
         panels_dir=panels_dir,
         n_panels=n_panels,
         timings=clock.timings,
         seconds=clock.total,
+        process_seconds=elapsed_since_import(),
+        cpu_seconds=None if cpu is None else cpu[0] + cpu[1],
+        load_start=load_start,
+        load_end=load_average(),
     )
 
 
