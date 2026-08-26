@@ -34,6 +34,28 @@ still be Metrica's data, just at lower precision; a generated match is not
 their data at any precision, and that is a claim that can be checked by running
 one script.
 
+### What overlap with the upstream files remains, measured
+
+Compared line by line against all twelve upstream CSVs (576,014 distinct
+non-empty lines) on 2026-08-25:
+
+- **13 whole lines match verbatim, and every one of them is a header row** —
+  the two events-file header rows, and the team-name, shirt-number and
+  column-name rows of the four tracking files. **Zero data rows match.**
+  Those header rows are the container: an events header identical for every
+  Metrica export, `Home` repeated over each pair, and anonymous `PlayerNN`
+  placeholders with their shirt numbers. There are no names, no positions and
+  no coordinates in them.
+- **11 of 13,663 adjacent `(x, y)` coordinate pairs collide**, 0.08%.
+  Regenerating the same fixtures from a different PRNG seed gives 9 of 13,663,
+  0.07% — the same rate, so the collisions are chance, not provenance. The
+  upstream files hold 6,396,548 distinct pairs.
+- Per-cell overlap is high (about 89%) and means nothing: upstream holds
+  246,842 distinct 5-decimal values in a space of roughly 100,000 slots per
+  unit interval, so it saturates the value space and almost any plausible
+  5-decimal number appears in it somewhere. The pair test above is the one
+  that discriminates.
+
 ### The quirks these fixtures exist to catch
 
 A generator that emitted clean, well-behaved data would silently retire the
