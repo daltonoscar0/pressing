@@ -17,6 +17,9 @@ data/raw/
 # generated output
 out/
 
+# matplotlib's font cache, kept in-repo so a fresh clone pays for the font scan once
+.mplcache/
+
 # generated reports at the repo root only; bundled/demo and docs PDFs are tracked
 /*.pdf
 !data/demo/**/*.pdf
