@@ -36,8 +36,40 @@ do with the analytics:
   points ``MPLCONFIGDIR`` at a repo-local directory on import; this module then
   pays for the scan *concurrently* with loading and scoring by starting
   :func:`pressing.warm_matplotlib_cache` before it touches the data and only
-  waiting on it when it finally needs a figure. Neither trick is a reduction in
-  work -- the timings :func:`run_demo` reports are wall clock over everything.
+  waiting on it when it finally needs a figure. The trick works: on the cold
+  runs below the wait left when a figure was finally needed was 10.4 s and
+  10.3 s, not the whole scan.
+
+What a fresh clone actually costs, measured
+-------------------------------------------
+Two independent ``git clone`` + ``uv sync`` + cold ``MPLCONFIGDIR`` runs with
+all outbound network refused in-process, timed end to end with
+``/usr/bin/time -p uv run pressing demo``::
+
+    clone 1   real 95.46 s      run_demo's own clock 46.1 s
+    clone 2   real 96.81 s      run_demo's own clock 42.8 s
+
+Inside the two-minute budget, with about 24 s of headroom -- not more.
+
+The gap between the two columns is the point, and it is a trap for anyone
+quoting the number this module prints. :class:`DemoResult` reports wall clock
+over the work :func:`run_demo` does, and it cannot report what happened before
+it was called: the interpreter starting and ``import pressing.demo`` pulling in
+numpy, pandas, pyarrow, matplotlib and reportlab. On a genuinely cold clone
+that import measured 65.5 s against 5.18 s of user CPU -- almost pure disk
+wait, reading shared objects that were written minutes earlier and never read.
+Warm it is 4.8 s. It is the single largest fresh-clone cost, it is larger than
+the font scan, and it is not something this module can overlap with anything,
+because nothing has started yet.
+
+So there are two honest numbers and they differ by a factor of four:
+
+* **23.5 s** -- ``run_demo``'s own clock, second run, everything warm. This is
+  the number to quote for the analytics.
+* **95.5 s** -- fresh clone, cold caches, no network, end to end. This is the
+  number the acceptance criterion is about.
+
+Quoting the first as if it were the second understates the real cost by ~70 s.
 
 Which five moments get printed
 ------------------------------
@@ -68,10 +100,10 @@ spec's literal reading is one flag away: ``pressing demo --rank recovered``.
 The page heading always states which ranking produced the panels, in words,
 from :data:`pressing.report.RANK_GLOSS`.
 
-The numbers this module's docstrings quote are wall clock measured by
-:func:`run_demo` itself; see ``README.md`` for the run they came from. The
-phase means, the 5-of-5 counts and the correlation above are reproducible with
-``score_losses`` on the bundled match -- see ``tests/test_demo.py``.
+Every timing above is wall clock from the runs described with it, not CPU and
+not an estimate. The phase means, the 5-of-5 counts and the correlation are
+reproducible with ``score_losses`` on the bundled match -- see
+``tests/test_demo.py``, which asserts them.
 """
 
 from __future__ import annotations
@@ -442,7 +474,11 @@ class DemoResult:
         panels_dir: Where ``--all-panels`` wrote, or None.
         n_panels: How many per-loss panels were written.
         timings: Wall clock in seconds per stage, in execution order.
-        seconds: Total wall clock for the run.
+        seconds: Total wall clock inside :func:`run_demo`. Not the cost of the
+            command: the interpreter start and the import of numpy, pandas,
+            pyarrow, matplotlib and reportlab all happen before this clock
+            starts, and on a cold clone they are the larger half. See the
+            module docstring for both numbers measured side by side.
     """
 
     pdf: Path
