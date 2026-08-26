@@ -1,8 +1,10 @@
 """Tests for :mod:`pressing.possession`.
 
 Most cases are built from hand-written event sequences so the expected answer is
-obvious by inspection. Two integration cases run against the truncated real
-Metrica CSVs under ``tests/fixtures/metrica``. Everything is offline.
+obvious by inspection. Two integration cases run against the synthetic
+Metrica-shaped CSVs under ``tests/fixtures/metrica``, which are written by
+``tests/fixtures/make_metrica_fixtures.py`` and carry no Metrica match data.
+Everything is offline.
 """
 
 from __future__ import annotations
@@ -24,6 +26,10 @@ from pressing.possession import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "metrica"
+
+#: Frame of game 2's only BALL LOST, whose End X/Y is NaN in the fixture so the
+#: locator has to fall back to the tracked ball. Set by the fixture generator.
+G2_LOSS_FRAME = 55071
 
 # (team, type, subtype, period, start_frame, end_frame, from, to, sx, sy, ex, ey)
 Row = tuple
@@ -251,18 +257,18 @@ def test_losses_come_back_ordered_by_frame(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Against the real (truncated) Metrica files
+# Against the synthetic Metrica-shaped files
 # --------------------------------------------------------------------------- #
 
 
-def test_real_slice_loss_uses_the_tracked_ball() -> None:
-    """Game 2's slice holds one BALL LOST whose End X/Y is NaN in the raw file."""
+def test_fixture_slice_loss_uses_the_tracked_ball() -> None:
+    """Game 2's slice holds one BALL LOST whose End X/Y is NaN in the CSV."""
     match = _io.load_metrica_match(2, FIXTURES)
     losses = detect_losses(match.events, match.tracking)
 
     assert len(losses) == 1
     row = losses.iloc[0]
-    assert row["frame"] == 68031
+    assert row["frame"] == G2_LOSS_FRAME
     assert row["period"] == 2
     assert row["losing_team"] == "home"
     assert row["winning_team"] == "away"
@@ -270,13 +276,13 @@ def test_real_slice_loss_uses_the_tracked_ball() -> None:
     assert row["location_source"] == "tracking_ball"
 
     ball = match.tracking[
-        (match.tracking["team"] == "ball") & (match.tracking["frame"] == 68031)
+        (match.tracking["team"] == "ball") & (match.tracking["frame"] == G2_LOSS_FRAME)
     ]
     assert row["x"] == pytest.approx(ball["x"].item())
     assert row["y"] == pytest.approx(ball["y"].item())
 
 
-def test_real_slice_possessions_respect_the_team_runs() -> None:
+def test_fixture_slice_possessions_respect_the_team_runs() -> None:
     match = _io.load_metrica_match(2, FIXTURES)
     possessions = segment_possessions(match.events)
     assert possessions["team"].tolist() == ["away", "home"]
