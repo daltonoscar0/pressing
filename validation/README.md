@@ -32,34 +32,48 @@ The shipped configuration (float32, `clamp="renormalise"`) scores a pooled r of 
 event of 257 below 0.95; section 9 of the notebook shows that gap is entirely the deliberate
 probability clamp described under **Caveats**, not a modelling difference.
 
-## Re-measured for the v0.1.0 tag
+## Re-measured for the v0.1.1 tag
 
-The comparison was re-run from scratch outside the notebook before tagging, over the same 257 events
-and the same reference grid, to confirm nothing had drifted while the rest of the package was built.
-It was run twice on the tagging day, hours apart. Nothing moved:
+The notebook was re-executed from a clean kernel into `out/` — leaving the committed file untouched —
+over the same 257 events and the same reference grid, to confirm nothing had drifted:
+
+```sh
+uv run jupyter nbconvert --execute --to notebook --output-dir out \
+    --output pitch_control_rerun.ipynb \
+    --ExecutePreprocessor.timeout=3600 validation/pitch_control_validation.ipynb
+```
+
+0 errors across all 20 code cells, and the comparison table came back identical to the committed one:
 
 | configuration | pooled r | mean per-event r | min per-event r | events < 0.95 | max abs difference |
 |---|---|---|---|---|---|
-| `clamp="raw"`, float64 | 1.0000000000 | 1.0000000000 | 1.0000000000 | 0 of 257 | 3.941e-15 |
-| shipped default (`clamp="renormalise"`, float32) | 0.9995631111 | 0.9991927210 | 0.9433488807 | 1 of 257 | 6.457e-01 |
+| `clamp="raw"`, float64 | 1.000000 | 1.000000 | 1.000000 | 0 of 257 | 3.941e-15 |
+| `clamp="raw"`, float32 | 1.000000 | 1.000000 | 1.000000 | 0 of 257 | 2.645e-03 |
+| shipped default (`clamp="renormalise"`, float32) | 0.999563 | 0.999193 | 0.943349 | 1 of 257 | 6.457e-01 |
 
 Same run: 411,200 cells compared per configuration, mean absolute difference 1.737e-16 and 7.183e-04
-respectively, reference maximum cell value 1.005366, raw `PA+PD` checksum range 0.990000 to 2.800681,
-y-flip guard 0.618073 and 0.618334 (both far below the aligned correlation).
+in the first and last rows, reference maximum cell value 1.005366, largest raw `PA+PD` checksum
+2.800681 on 2,776 cells of 411,200 (0.675%), every one of the 2,462 disagreements above 0.01 sitting
+on such a cell, y-flip guard 0.618073. The headline `POOLED PEARSON r` line prints ten decimals for
+the reference convention and reads `1.0000000000`.
 
-Timings from the second of those runs: the reference took 315.75 s for the 257 surfaces, 1228.6 ms
-each, against 20.66 ms each in the shipped float32 configuration and 27.53 ms in the reference's own
-float64 convention — **59x** and **45x**. Both halves were timed on a machine shared with unrelated
-work, so they are slower than the notebook's committed numbers and only the ratio means anything. The
-correlations, as always, did not move: they were identical to ten decimal places across both reruns
-and the notebook.
+### Timings, and why only one number here is worth reading
 
-Timing on the same grid and the same 257 events: reference 248.28 s (0.9661 s per surface), ours
-4.04 s (0.0157 s per surface) — **61.5x**. Wall-clock timings move with machine load; three full
-runs on the same laptop gave 59.1x, 59.3x and the 61.5x recorded in the committed outputs. The
-correlations do not move at all. That margin is the reason the demo fits its runtime budget: a
-straight port of the reference's per-cell Python loop would spend four to five minutes on pitch
-control alone in a single match.
+**The ratio between the two implementations is the measurement; the seconds are a property of whatever
+else the laptop was doing.** Two runs are recorded in this repository:
+
+| run | reference total | per surface | ours (shipped config) | per surface | ratio |
+|---|---:|---:|---:|---:|---:|
+| the committed notebook's own timing cell | 248.28 s | 0.9661 s | 4.04 s | 0.0157 s | **61.5x** |
+| the v0.1.1 rerun above, at a 1-minute load average of 4.35 → 6.12 | 151.61 s | 0.5899 s | 2.48 s | 0.0096 s | **61.2x** |
+
+The absolute totals differ by a factor of 1.6 between those two runs of identical code on identical
+data. The ratio moves by 0.3x and the correlations do not move at all. Earlier versions of this file
+carried two separate timing paragraphs quoting a third and fourth pair of figures with different
+ratios; they disagreed with each other, neither could be tied to a run recorded here, and they have
+been removed rather than reconciled. That margin — sixty-something to one — is the reason the demo
+fits its runtime budget: a straight port of the reference's per-cell Python loop would spend minutes
+on pitch control alone in a single match.
 
 ## Method
 
@@ -129,11 +143,17 @@ Metrica sample data lives under `data/raw/`, which is gitignored; fetch it with 
 first. Then, from the repository root:
 
 ```sh
-uv run jupyter nbconvert --execute --to notebook --inplace \
+uv run jupyter nbconvert --execute --to notebook --output-dir out \
+    --output pitch_control_rerun.ipynb \
     --ExecutePreprocessor.timeout=3600 validation/pitch_control_validation.ipynb
 ```
 
-It takes about five minutes, almost all of it the reference's per-cell Python loop. The notebook
+That writes the executed copy into gitignored `out/` and leaves the committed notebook alone, so a
+rerun cannot quietly overwrite the evidence with itself. Use `--inplace` instead only when you mean to
+replace the committed outputs.
+
+On the run recorded above it took about three minutes of wall clock, almost all of it the reference's
+per-cell Python loop, and it will take considerably longer on a busy machine. The notebook
 fails loudly rather than degrading quietly: it asserts the vendored hashes, the model constants, the
 grid alignment, the four orientation guards, the acceptance threshold, and the claim that every
 clamp disagreement lands on an overshooting cell.

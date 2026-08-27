@@ -72,17 +72,45 @@ git remote, so nothing here is published anywhere.
 Derived on **2026-08-26T03:51:41+00:00** (UTC) from Metrica sample Game 1, by
 `pressing.demo.build_demo_assets("<dir holding Sample_Game_1/>")`.
 
-**The upstream commit was not recorded when the CSVs were fetched, and cannot
-be recovered offline.** Rather than print a plausible-looking SHA nobody
-verified, here are the SHA-256 digests of the three upstream files the assets
-were actually derived from, which anyone with a clone of the upstream
-repository can check for themselves:
+### The upstream commit
 
-| Upstream file | Bytes | SHA-256 |
-|---|---:|---|
-| `Sample_Game_1_RawEventsData.csv` | 139,446 | `097dda6345e17390dca095331458fd00e47960c480c76f4356fd4edf2575ef05` |
-| `Sample_Game_1_RawTrackingData_Away_Team.csv` | 32,782,073 | `0a3df68a92af0290ede472e62de3b6489ddee29223da09bdf0cf76c8e0ab0618` |
-| `Sample_Game_1_RawTrackingData_Home_Team.csv` | 32,782,961 | `0a3d0eff7785950379c587d3597b86a2d91c2492281b4652e1abb97c99b6b364` |
+**Upstream commit: `e706dd506b360d69d9d123d5b8026e7294b13996`** — the tip of
+`master` in `metrica-sports/sample-data`, committed 2021-04-15, verified
+2026-08-27.
+
+The commit id was not written down when the CSVs were fetched, so it was
+recovered afterwards by content rather than asserted from memory, and the three
+digests below are what made that possible. Each of the three source files was
+hashed as a git blob and matched against the repository's own tree, then
+downloaded again from that commit and compared byte for byte:
+
+```sh
+# the blob ids of the local copies, and the tree GitHub serves for that commit
+git hash-object data/raw/metrica/Sample_Game_1__Sample_Game_1_Raw*.csv
+curl -s 'https://api.github.com/repos/metrica-sports/sample-data/git/trees/\
+e706dd506b360d69d9d123d5b8026e7294b13996?recursive=1'
+```
+
+| Upstream file | Bytes | git blob | SHA-256 |
+|---|---:|---|---|
+| `Sample_Game_1_RawEventsData.csv` | 139,446 | `3c426dd4f442dd433bccf89e3634f91aa310cd8f` | `097dda6345e17390dca095331458fd00e47960c480c76f4356fd4edf2575ef05` |
+| `Sample_Game_1_RawTrackingData_Away_Team.csv` | 32,782,073 | `ff409a5680fd75acc7cebcf786827214c687478b` | `0a3df68a92af0290ede472e62de3b6489ddee29223da09bdf0cf76c8e0ab0618` |
+| `Sample_Game_1_RawTrackingData_Home_Team.csv` | 32,782,961 | `ce2e91c0e633426cec1146f4e728b72417454e3d` | `0a3d0eff7785950379c587d3597b86a2d91c2492281b4652e1abb97c99b6b364` |
+
+All three blob ids appear verbatim in that commit's tree under
+`data/Sample_Game_1/`, and re-downloading all three files from
+`raw.githubusercontent.com` at that commit and running `cmp` against the local
+copies reported no difference on any of them.
+
+**What that does and does not establish.** It establishes that the bytes these
+assets were derived from are the bytes that commit publishes. It does not
+establish that `e706dd50` was the checkout that happened to be fetched: these
+three files entered the repository in commit
+`5f825443fa855896701b1460f193cca2899c61e6` (2020-04-01) and have never been
+modified since — `GET /repos/metrica-sports/sample-data/commits?path=…` returns
+exactly that one commit for each of them — so every commit from then to the tip
+carries identical content. Any of them would be a true answer; the tip is the
+one a reader who clones today will get.
 
 What was written:
 
