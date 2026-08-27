@@ -44,8 +44,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pressing import report
-from pressing.counterpress import LOSS_SCORE_COLUMNS, CounterPressParams
+from pressing import baseline, plots, report
+from pressing.counterpress import LOSS_SCORE_COLUMNS, CounterPressParams, per_player
+from pressing.phases import label_loss_phases
 from pressing.pitchcontrol import make_grid
 from pressing.schema import PITCH_LENGTH, PITCH_WIDTH, TRACKING_COLUMNS
 
@@ -333,6 +334,59 @@ def built(
 
 
 @pytest.fixture(scope="module")
+def busy() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A match with enough losses per phase to run a between-player test.
+
+    The permutation test wants at least three players carrying at least five
+    losses each inside a single phase column. Nine losses over twelve players
+    never reaches that, which is itself a fact the report has to handle -- see
+    the "too thin to test" case -- but it leaves the interesting branch
+    untested, so this fixture is deliberately busy.
+    """
+    tracking = make_tracking(n_players=6, n_frames=2400)
+    losses = make_losses(tracking, n=90)
+    # make_losses scatters turnovers uniformly, which on this synthetic pitch
+    # leaves most of them out of every player's 15 m radius -- 26 credits over
+    # 90 losses. Putting each turnover on top of a real player, cycling through
+    # the squad, is what makes the per-player table dense enough to test.
+    positions = tracking[tracking["team"].isin(("home", "away"))].set_index(
+        ["frame", "player_id"]
+    )
+    squads = {
+        side: sorted(set(tracking.loc[tracking["team"] == side, "player_id"]))
+        for side in ("home", "away")
+    }
+    x: list[float] = []
+    y: list[float] = []
+    for index, row in enumerate(losses.to_dict("records")):
+        squad = squads[str(row["losing_team"])]
+        spot = positions.loc[(int(row["frame"]), squad[index % len(squad)])]
+        x.append(float(spot["x"]))
+        y.append(float(spot["y"]))
+    losses["x"] = x
+    losses["y"] = y
+    attrs = dict(losses.attrs)
+    losses = label_loss_phases(losses, tracking.attrs["attack_direction"])
+    losses.attrs.update(attrs)
+    return tracking, losses
+
+
+@pytest.fixture(scope="module")
+def built_busy(
+    busy: tuple[pd.DataFrame, pd.DataFrame], tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """The report for :func:`busy`, built once."""
+    tracking, losses = busy
+    return report.build_report(
+        tracking,
+        losses,
+        "home",
+        tmp_path_factory.mktemp("busy") / "busy.pdf",
+        grid=TEST_GRID,
+    )
+
+
+@pytest.fixture(scope="module")
 def built_proxy(
     match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
@@ -405,6 +459,19 @@ def pdf_text(path: Path) -> str:
         joined. Not laid out and not deduplicated: this is for membership
         tests, not for reading.
     """
+    return "\n".join(_page_texts(path))
+
+
+def _page_texts(path: Path) -> list[str]:
+    """Decoded text, one entry per content stream, in file order.
+
+    Args:
+        path: The PDF.
+
+    Returns:
+        The text of each stream that draws any, in the order reportlab wrote
+        them -- which is page order.
+    """
     streams = [_decode_stream(blob) for blob in _STREAM.findall(Path(path).read_bytes())]
     tables: list[dict[int, str]] = []
     for stream in streams:
@@ -420,11 +487,13 @@ def pdf_text(path: Path) -> str:
         if b"Tj" not in stream and b"TJ" not in stream:
             continue
         chunks = [_unescape(match.group(0)[1:-1]) for match in _LITERAL.finditer(stream)]
-        for table in tables:
-            out.append(
+        out.append(
+            "\n".join(
                 "\n".join("".join(table.get(byte, "") for byte in chunk) for chunk in chunks)
+                for table in tables
             )
-    return "\n".join(out)
+        )
+    return out
 
 
 def pdf_prose(path: Path) -> str:
@@ -442,6 +511,41 @@ def pdf_prose(path: Path) -> str:
         The flattened text.
     """
     return " ".join(pdf_text(path).split())
+
+
+def pdf_page_prose(path: Path) -> list[str]:
+    """:func:`pdf_prose`, split one string per page, in page order.
+
+    Several of the claims below are about *where* a sentence is printed, not
+    merely that it exists somewhere in the document -- the whole finding that
+    forced the page-6 warning was that the field-position caveat was on pages 1
+    and 2 and nowhere near the table it applies to. A test that greps the whole
+    PDF cannot tell those two states apart.
+
+    Reportlab writes one content stream per page, in order, and the running
+    footer stamps "page N of 6" into each. Both are asserted here, so a future
+    reportlab that batches pages differently fails this helper loudly instead
+    of silently making every caller vacuous.
+
+    Args:
+        path: The PDF.
+
+    Returns:
+        One flattened string per page.
+
+    Raises:
+        AssertionError: If the page streams cannot be told apart by footer.
+    """
+    pages = [
+        " ".join(text.split())
+        for text in _page_texts(path)
+        if text.strip()
+    ]
+    numbered = [page for page in pages if re.search(r"page \d+ of \d+", page)]
+    assert numbered, "no page carries a footer, so the split cannot be trusted"
+    for index, page in enumerate(numbered, start=1):
+        assert f"page {index} of " in page, f"stream {index} does not carry its own footer"
+    return numbered
 
 
 def page_count(path: Path) -> int:
@@ -627,6 +731,512 @@ def test_non_latin1_player_names_survive_into_the_text_layer(tmp_path: Path) -> 
     for name in AWKWARD_NAMES:
         assert name in text, f"{name!r} did not survive into the text layer"
         assert "�" not in text
+
+
+# --------------------------------------------------------------------------- #
+# What the report has to admit about itself
+#
+# Two measured findings drove every test in this section. On the bundled
+# Metrica match, over the 27 players the report prints a Recovery for, a cubic
+# in the attacking fraction of the turnover -- position and nothing else --
+# reproduces the printed column at r = +0.9771 (R2 = 0.9547, Spearman +0.9402),
+# and the player's own mean turnover position alone reaches R2 = 0.9583. At
+# loss level a straight line in x_norm gives R2 = 0.8212 over the 255 scored
+# losses. And the remedy the report used to prescribe does not work: a
+# 5,000-shuffle permutation test on the three per-phase player columns,
+# shuffled within a squad, gives p = 0.97 (build-up), 0.86 (middle) and 0.16
+# (final third), with the build-up spread SMALLER than chance. Every command
+# behind those numbers is in the module docstring of ``pressing.baseline``.
+#
+# So the tests here are not "a caveat exists". They are: the warning is on the
+# page a coach photocopies, its numbers are measured on the match in hand
+# rather than copied from this comment, and a cell with too little behind it
+# does not print a number at all.
+# --------------------------------------------------------------------------- #
+
+
+def measure(
+    tracking: pd.DataFrame, losses: pd.DataFrame, team: str = "home"
+) -> tuple[report.Disclosure, pd.DataFrame]:
+    """Run the report's own self-measurement over a synthetic match.
+
+    Args:
+        tracking: Canonical tracking frame.
+        losses: Scored losses, with or without the baseline columns.
+        team: Subject team.
+
+    Returns:
+        ``(disclosure, players)`` exactly as :func:`report.build_report` builds
+        them, so a test asserting on the numbers is asserting on the numbers
+        the pages print.
+    """
+    scored = report.with_expected_recovery(losses, tracking)
+    players = per_player(scored, tracking)
+    other = "away" if team == "home" else "home"
+    printed = pd.concat(
+        [report._player_rows(players, team), report._player_rows(players, other)]
+    )
+    disclosure = report.measure_disclosure(
+        scored, players, tracking, team, printed=printed
+    )
+    return disclosure, players
+
+
+def test_page_six_opens_with_the_field_position_warning(built: Path) -> None:
+    """The warning is on page 6 itself, not only on the cover.
+
+    This is the finding in its purest form: page 6 is a per-player ranking, it
+    is the page that gets photocopied and pinned up, and it used to carry no
+    field-position warning at all.
+    """
+    pages = pdf_page_prose(built)
+    assert report.RANK_WARNING_HEADING in pages[5]
+    assert "map of where each player plays" in pages[5]
+
+
+def test_page_six_prints_the_measured_position_correlation(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """The warning carries a number, and it is the number this match measures."""
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    assert np.isfinite(disclosure.position_r)
+    page = pdf_page_prose(built)[5]
+    assert f"r = {report._signed(disclosure.position_r, 2)}" in page
+    assert f"{disclosure.position_r ** 2 * 100.0:.0f}% of everything separating" in page
+    assert f"over {disclosure.position_rows} players" in page
+
+
+def test_the_position_correlation_is_measured_not_a_constant(
+    tmp_path: Path,
+) -> None:
+    """Two matches, two different printed numbers.
+
+    A warning that prints a figure an audit once measured on somebody else's
+    match is worse than no warning: it is a false number in the place a reader
+    trusts most. This drives the same code down two matches that differ only in
+    how tightly recovery tracks the turnover's position, and requires the
+    printed correlations to differ.
+    """
+    tracking = make_tracking(n_players=6, n_frames=900)
+    geography = make_losses(tracking, n=24)
+    # Recovery *is* position: the strongest possible version of the finding.
+    geography["recovery"] = geography["x_norm"].to_numpy(dtype=float) * 0.8 + 0.1
+    geography["recovery_area"] = geography["recovery"]
+
+    noise = geography.copy()
+    noise.attrs.update(geography.attrs)
+    # The same values, dealt out in an order that has nothing to do with x.
+    noise["recovery"] = np.random.default_rng(0).permutation(
+        geography["recovery"].to_numpy(dtype=float)
+    )
+    noise["recovery_area"] = noise["recovery"]
+
+    tight, _ = measure(tracking, geography)
+    loose, _ = measure(tracking, noise)
+    assert tight.position_r > loose.position_r
+    printed = {
+        report._signed(tight.position_r, 2),
+        report._signed(loose.position_r, 2),
+    }
+    assert len(printed) == 2, f"both matches printed {printed}"
+
+
+def test_a_thin_player_is_suppressed_rather_than_printed_as_a_number(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], tmp_path: Path
+) -> None:
+    """Below the minimum count the cell says so instead of showing a mean.
+
+    The threshold is derived in ``pressing.baseline``: eleven is the count at
+    which a 95% bootstrap interval on a player's mean first becomes narrower
+    than the whole range of player means, i.e. the least a number must manage
+    before it can order anybody against anybody.
+    """
+    tracking, events, losses = match
+    disclosure, players = measure(tracking, losses)
+    thin = players[~players["reportable"].to_numpy(dtype=bool)]
+    assert not thin.empty, "the fixture must contain at least one thin player"
+    assert (thin["losses_nearby"] < baseline.MIN_LOSSES_FOR_PLAYER).all()
+
+    path = report.build_report(
+        tracking,
+        losses,
+        "home",
+        tmp_path / "suppressed.pdf",
+        events=events,
+        grid=TEST_GRID,
+    )
+    page = pdf_page_prose(path)[5]
+    marker = report.SUPPRESSED.format(minimum=baseline.MIN_LOSSES_FOR_PLAYER)
+    assert marker in page
+    for value in thin["mean_recovery"].dropna():
+        assert report._num(value, 2) not in page, "a suppressed mean reached the page"
+
+
+def test_a_suppressed_row_suppresses_every_derived_cell(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+) -> None:
+    """One decision, not four.
+
+    Recovery, the residual, its interval and the EPV swing are all per-loss
+    means over the same losses. A page that hides one of them at n = 7 and
+    prints another says two different things about one sample -- and makes the
+    warning's own "no cell prints unless 11 losses stand behind it" false on
+    the page that prints it.
+    """
+    tracking, _, losses = match
+    disclosure, players = measure(tracking, losses)
+    fonts = report.register_pdf_fonts()
+    styles = report._build_styles(*fonts)
+    table, _, _ = report._player_table(players, "home", {}, styles, fonts, disclosure)
+    marker = report.SUPPRESSED.format(minimum=baseline.MIN_LOSSES_FOR_PLAYER)
+    rows = {
+        str(row[1].text if hasattr(row[1], "text") else row[1]): row
+        for row in table._cellvalues[1:]
+    }
+    shown = report._player_rows(players, "home")
+    for record in shown.to_dict("records"):
+        if bool(record.get("reportable", False)):
+            continue
+        row = rows[str(record["player_id"])]
+        # Recovery, vs expected and EPV swing, with an empty interval between.
+        assert row[4] == marker
+        assert row[5] == marker
+        assert row[6] == ""
+        assert row[7] == marker
+
+
+def test_phase_headings_carry_their_own_permutation_p_value(
+    busy: tuple[pd.DataFrame, pd.DataFrame], built_busy: Path
+) -> None:
+    """The question "does this column separate anybody?" is answered on it."""
+    tracking, losses = busy
+    disclosure, _ = measure(tracking, losses)
+    assert any(np.isfinite(value) for value in disclosure.phase_p.values())
+    page = pdf_page_prose(built_busy)[5]
+    for phase, p_value in disclosure.phase_p.items():
+        assert report._p_header(p_value) in page, f"{phase} heading lost its p-value"
+    assert f"{report.PERMUTATION_SHUFFLES:,}-shuffle permutation test" in page
+
+
+def test_a_match_too_thin_to_test_prints_no_p_value_rather_than_a_fake_one(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """Nine losses cannot support a between-player test, and the page says nothing.
+
+    The permutation test needs at least three players with at least five losses
+    each in the column. A page that printed "p = 1.00" from two players would
+    be inventing a result; a page that printed nothing at all would leave the
+    reader assuming one was found. It prints "p n/a" and omits the paragraph.
+    """
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    assert all(not np.isfinite(value) for value in disclosure.phase_p.values())
+    page = pdf_page_prose(built)[5]
+    assert "p n/a" in page
+    assert "None of them separates players by more than chance" not in page
+    assert "By the same test they give" not in page
+
+
+def test_the_warning_states_the_phase_columns_carry_no_signal(
+    busy: tuple[pd.DataFrame, pd.DataFrame], built_busy: Path
+) -> None:
+    """When no phase column clears the test, the page says so in words.
+
+    This is the second critical finding put on the paper: the report tells the
+    reader to compare within a phase, and on the bundled match a 5,000-shuffle
+    test on those three columns returns p = 0.97, 0.86 and 0.16 -- with the
+    build-up spread smaller than chance. The page has to say so where the
+    columns are.
+    """
+    tracking, losses = busy
+    disclosure, _ = measure(tracking, losses)
+    measured = [value for value in disclosure.phase_p.values() if np.isfinite(value)]
+    assert measured, "the busy fixture must produce at least one usable p-value"
+    page = pdf_page_prose(built_busy)[5]
+    assert "the comparison the rest of this report tells you to make" in page
+    for phase, value in disclosure.phase_p.items():
+        if np.isfinite(value):
+            assert f"p = {value:.2f} in the {phase.replace('_', ' ')}" in page
+    if all(value >= 0.05 for value in measured):
+        assert "None of them separates players by more than chance" in page
+    else:
+        assert "Read them one column at a time" in page
+
+
+def test_an_empty_phase_column_is_explained_rather_than_left_blank(
+    busy: tuple[pd.DataFrame, pd.DataFrame], built_busy: Path
+) -> None:
+    """A column with nothing in it is a fact about the match, not a rendering bug.
+
+    On the bundled match no player on either squad is near eleven build-up
+    turnovers, so that column prints nothing for anybody. A reader scanning a
+    blank column has no way to tell that from a broken one.
+    """
+    tracking, losses = busy
+    disclosure, _ = measure(tracking, losses)
+    blank = [
+        phase for phase in disclosure.phase_printed if disclosure.phase_printed[phase] == 0
+    ]
+    assert blank, "the busy fixture must leave at least one phase column empty"
+    page = pdf_page_prose(built_busy)[5]
+    for phase in blank:
+        assert phase.replace("_", " ") in page
+    assert "empty for a reason, not by mistake" in page
+
+
+def test_a_table_with_nothing_suppressed_says_so_too(
+    busy: tuple[pd.DataFrame, pd.DataFrame], built_busy: Path
+) -> None:
+    """The suppression sentence describes this table, whichever way it fell."""
+    tracking, losses = busy
+    disclosure, _ = measure(tracking, losses)
+    page = pdf_page_prose(built_busy)[5]
+    if disclosure.suppressed_rows:
+        assert f"silences every number on {disclosure.suppressed_rows} of these" in page
+    else:
+        assert "Every row here clears it for Recovery" in page
+
+
+def test_the_cover_states_the_regain_correlation(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """The two stacked headline rows are not one finding said twice.
+
+    Measured on the bundled match, r(recovery, regained_within_5s) = +0.071
+    over its 255 scored losses. The cover prints recovery immediately above
+    regain, so the cover is where that has to be said.
+    """
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    assert np.isfinite(disclosure.regain_r)
+    cover = pdf_page_prose(built)[0]
+    assert "These two rows are almost unrelated" in cover
+    assert f"r = {report._signed(disclosure.regain_r, 2)}" in cover
+    assert f"{disclosure.n_scored} scored losses" in cover
+
+
+def test_the_regain_note_is_left_out_when_it_cannot_be_measured() -> None:
+    """An unmeasurable correlation removes the sentence; it never guesses."""
+    fonts = report.register_pdf_fonts()
+    styles = report._build_styles(*fonts)
+    assert report._regain_note(None, styles) is None
+    assert report._regain_note(report.Disclosure(), styles) is None
+    said = report._regain_note(report.Disclosure(regain_r=0.07, n_scored=255), styles)
+    assert said is not None
+    assert "+0.07" in said.text
+
+
+def test_the_cover_marks_which_direction_of_each_row_is_good(built: Path) -> None:
+    """A row where higher is worse must not be styled like one where it is better."""
+    cover = pdf_page_prose(built)[0]
+    assert "Better is" in cover
+    assert "Median time to regain" in cover
+    assert report.POLARITY_LEGEND.split(" — ")[0] in cover
+    # Both directions occur in the table, so neither label is dead code.
+    assert report._POLARITY["recovery"] == "higher"
+    assert report._POLARITY["time_to_regain"] == "lower"
+    assert report._POLARITY["epv"] == "lower"
+
+
+def test_the_cover_shows_the_phase_mix_check_it_demands(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """A pooled difference printed above a caveat forbidding it shows its working."""
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    cover = pdf_page_prose(built)[0]
+    assert "Putting both on the match's own phase mix" in cover
+    assert report._signed(disclosure.standardised_difference, 3) in cover
+    assert report._signed(disclosure.raw_difference, 3) in cover
+    verdict = "the sign survives" if disclosure.standardisation_holds else "does NOT survive"
+    assert verdict in cover
+
+
+def test_the_unscored_footnote_agrees_with_the_map(tmp_path: Path) -> None:
+    """The page must not promise grey crosses the reader cannot see.
+
+    ``plots.loss_map`` can only draw a loss it has coordinates for, so an
+    unscored loss with no ball position reaches neither the cross layer nor the
+    "not scored" legend entry. On the bundled match the single unscored loss is
+    exactly that kind, and the footnote used to boast about drawing it anyway.
+    This asserts the two agree, in both directions, by reading the legend of
+    the figure the page actually embeds.
+    """
+    tracking = make_tracking(n_players=4, n_frames=500)
+
+    undrawable = make_losses(tracking, n=6, unlocated=2)
+    drawable = make_losses(tracking, n=6)
+    # Unscored, but with a position: the metric failed on it, the map can draw
+    # it, and the footnote is allowed to say so.
+    drawable.loc[0, "scored"] = False
+    drawable.loc[0, "skip_reason"] = "window_cut_short"
+    drawable.attrs.update(drawable.attrs | {"n_skipped": 1})
+
+    for losses, expect_crosses in ((undrawable, False), (drawable, True)):
+        disclosure, _ = measure(tracking, losses)
+        note = report._unscored_note(disclosure)
+        figure = plots.loss_map(losses)
+        labels = {
+            text.get_text()
+            for axis in figure.axes
+            for legend in ([axis.get_legend()] if axis.get_legend() else [])
+            for text in legend.get_texts()
+        }
+        # `plots` never imports pyplot -- see the invariant asserted in
+        # tests/test_plots.py -- so there is no global registry to close
+        # against, and clearing the figure is the whole teardown.
+        figure.clear()
+        drawn = "not scored" in labels
+        assert drawn is expect_crosses, f"legend {labels}"
+        if drawn:
+            assert "drawn as grey crosses" in note
+        else:
+            assert "no grey crosses on this map" in note
+
+
+def test_the_unscored_footnote_reconciles_the_phase_table(tmp_path: Path) -> None:
+    """A loss with no position has no third either, and the pages add up.
+
+    The cover counts every detected loss; page 2's phase table can only count
+    the ones that have a pitch third. On the bundled match those two are 256
+    and 255, and a reader who adds the Losses column and gets a different
+    number from the headline deserves the sentence that explains it.
+    """
+    tracking = make_tracking(n_players=4, n_frames=500)
+    losses = make_losses(tracking, n=6, unlocated=2)
+    disclosure, _ = measure(tracking, losses)
+    assert disclosure.total_losses == 6
+    assert disclosure.phase_rows == 4
+    assert disclosure.phase_table_short_by == 2
+
+    path = report.build_report(
+        tracking, losses, "home", tmp_path / "short.pdf", grid=TEST_GRID
+    )
+    pages = pdf_page_prose(path)
+    assert "adds up to 4 and not the 6 the cover counts" in pages[1]
+    assert "page 2's phase table works from 4" in pages[0]
+
+
+def test_a_match_with_nothing_missing_makes_no_excuses(tmp_path: Path) -> None:
+    """No unscored losses, no sentence about unscored losses."""
+    tracking = make_tracking(n_players=4, n_frames=500)
+    losses = make_losses(tracking, n=6)
+    disclosure, _ = measure(tracking, losses)
+    assert disclosure.unscored == 0
+    note = report._unscored_note(disclosure)
+    assert "Every loss on this map was scored" in note
+    assert "grey cross" not in note.replace("grey crosses on it", "")
+
+
+def test_the_residual_is_flagged_as_in_sample_on_a_single_match(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """One match cannot hold anything out, and the page admits it."""
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    assert disclosure.residual_out_of_sample is False
+    assert "in-sample and if anything flatters itself" in pdf_page_prose(built)[5]
+
+
+def test_disclosure_survives_a_match_it_cannot_measure() -> None:
+    """Nothing scorable means no numbers, and no numbers means no sentences."""
+    tracking = make_tracking(n_players=3, n_frames=300)
+    losses = make_losses(tracking, n=3, unlocated=3)
+    disclosure, _ = measure(tracking, losses)
+    assert disclosure.n_scored == 0
+    assert not disclosure.has_position_check
+    fonts = report.register_pdf_fonts()
+    styles = report._build_styles(*fonts)
+    warning = report._rank_warning(disclosure, styles)
+    assert warning is not None
+    flat = " ".join(
+        " ".join(str(getattr(item, "text", "")) for item in cell)
+        for row in warning._cellvalues
+        for cell in row
+    )
+    assert "r = —" not in flat
+    assert "nan" not in flat.lower()
+
+
+def page_six_story(
+    tracking: pd.DataFrame, losses: pd.DataFrame
+) -> tuple[list[Any], report.Disclosure]:
+    """Page 6's flowables, without going through a PDF.
+
+    Args:
+        tracking: Canonical tracking frame.
+        losses: Scored losses.
+
+    Returns:
+        ``(story, disclosure)``.
+    """
+    disclosure, players = measure(tracking, losses)
+    fonts = report.register_pdf_fonts()
+    styles = report._build_styles(*fonts)
+    story = report.player_table_page(
+        players,
+        "home",
+        goalkeepers=tracking.attrs.get("goalkeeper", {}) or {},
+        labels=None,
+        radius_m=report.DEFAULT_RADIUS_M,
+        styles=styles,
+        fonts=fonts,
+        opponent="away",
+        disclosure=disclosure,
+    )
+    return story, disclosure
+
+
+def test_page_six_does_not_overflow_far_enough_to_shrink_the_warning(
+    busy: tuple[pd.DataFrame, pd.DataFrame]
+) -> None:
+    """Page 6 has to nearly fit, because overflow is paid for in warning size.
+
+    ``build_report`` wraps every page in ``KeepInFrame(mode="shrink")``, which
+    holds the page count at six by scaling the whole page down. Measured on the
+    bundled match when the warning was first added: 1,033 pt of content in a
+    748 pt frame, a scale of 0.72, and squad tables 367 pt wide inside a 510 pt
+    frame -- at which point the warning heading renders at 7.6 pt. The bound
+    here is loose because two full squads is genuinely a lot of page; it exists
+    to catch a return to 0.72, not to police 0.95.
+    """
+    tracking, losses = busy
+    story, _ = page_six_story(tracking, losses)
+    total = sum(
+        item.wrap(report.FRAME_W, report.FRAME_H)[1]
+        + item.getSpaceBefore()
+        + item.getSpaceAfter()
+        for item in story
+    )
+    assert total <= report.FRAME_H * 1.15, (
+        f"page 6 is {total:.0f} pt of content in a {report.FRAME_H:.0f} pt frame, "
+        f"a scale of {report.FRAME_H / total:.2f}"
+    )
+
+
+def test_whatever_page_six_shrink_remains_is_uniform(
+    busy: tuple[pd.DataFrame, pd.DataFrame]
+) -> None:
+    """A shrunk page must read as a smaller page, not a broken one.
+
+    ``KeepInFrame`` re-wraps an overflowing page at a wider measure and draws
+    the result scaled down. A paragraph reflows into that wider measure and
+    comes back full width; a table with fixed column widths cannot. Mixing the
+    two puts 367 pt tables under 496 pt of footnote. Every block on this page
+    is therefore pinned to the frame width, so all of it shrinks together.
+    """
+    tracking, losses = busy
+    story, _ = page_six_story(tracking, losses)
+    for item in story:
+        if isinstance(item, report.Paragraph):
+            # Headings are single lines: they scale, they do not reflow.
+            assert "\n" not in item.text
+            continue
+        if isinstance(item, report.Spacer):
+            continue
+        width, _ = item.wrap(report.FRAME_W, report.FRAME_H)
+        assert width == pytest.approx(report.FRAME_W), f"{type(item).__name__} is {width:.0f} pt"
 
 
 # --------------------------------------------------------------------------- #
