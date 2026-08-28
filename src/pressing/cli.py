@@ -25,6 +25,14 @@ not been wired up -- says so in one line and exits :data:`NOT_BUILT` rather than
 raising through a traceback: an unbuilt feature is not a crash, and it should
 not read like one.
 
+Every path a subcommand will eventually write to is checked before any work
+starts, by :func:`_check_output_path`. ``pressing demo --out <a directory>`` used
+to load the match, score 255 of its 256 possession losses and render five panels
+and only then raise ``IsADirectoryError`` out of reportlab: 44.11 s of user CPU
+spent to deliver a typo, as a 60-line traceback. A destination that cannot be
+written is a usage mistake, and a usage mistake should cost one line and no
+seconds -- the same command now fails in 0.10 s.
+
 Exit codes: 0 success, 1 the run could not proceed, 2 a usage error (click's,
 not ours -- a bad flag), 3 the feature is not built.
 
@@ -47,6 +55,7 @@ scan with real work if matplotlib has not already been imported at module load.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn
@@ -116,6 +125,95 @@ def _fail(message: str) -> NoReturn:
 def _echo(message: str) -> None:
     """Write one progress line to stderr, keeping stdout for the result."""
     typer.secho(message, err=True)
+
+
+def _nearest_existing(path: Path) -> Path:
+    """The closest ancestor of ``path`` that exists, ``path`` itself included.
+
+    Used to answer "could this be created?" without creating it. ``Path.parents``
+    ends at ``.`` for a relative path and at ``/`` for an absolute one, both of
+    which exist, so the loop always finds something.
+
+    Args:
+        path: The path being checked.
+
+    Returns:
+        The first existing path in ``[path, *path.parents]``.
+    """
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate
+    return path  # pragma: no cover - only reachable if the root vanishes mid-run
+
+
+def _check_output_path(
+    path: Path,
+    flag: str,
+    kind: Literal["file", "dir"],
+    example: str = "output",
+) -> None:
+    """Refuse a destination that cannot be written, before any work is done.
+
+    Every write in this tool happens at the end of the run, so an unwritable
+    destination is discovered after the whole pipeline has been paid for and
+    surfaces as a library traceback -- ``IsADirectoryError`` out of reportlab,
+    ``FileExistsError`` out of ``Path.mkdir``. None of those name the flag the
+    user got wrong. The four failures checked here are the four that were
+    reproducible from the command line: a directory where a file was wanted, a
+    file where a directory was wanted, a parent that is a file so no directory
+    can be made under it, and a destination inside somewhere unwritable.
+
+    Existence is not required and nothing is created: every writer downstream
+    does ``mkdir(parents=True, exist_ok=True)`` itself, and a command that
+    creates directories and then fails for another reason leaves litter behind.
+
+    Args:
+        path: What the user passed.
+        flag: The option it came from, for the message.
+        kind: Whether ``path`` names a file to write or a directory to fill.
+        example: A plausible filename, used only to show the shape wanted when
+            a directory was passed where a file belongs. Ignored for ``"dir"``.
+
+    Raises:
+        typer.Exit: With code 1, and a sentence, if the path cannot be written.
+    """
+    if kind == "file" and path.is_dir():
+        _fail(
+            f"{flag} takes a file, and {path} is a directory. "
+            f"Pass a filename, e.g. {path / example}."
+        )
+    if kind == "dir" and path.exists() and not path.is_dir():
+        _fail(f"{flag} takes a directory, and {path} is a file.")
+
+    container = path.parent if kind == "file" else path
+    anchor = _nearest_existing(container)
+    if not anchor.is_dir():
+        _fail(
+            f"{flag}: {anchor} is a file, not a directory, so nothing can be written "
+            f"under it. Wanted to put {path} there."
+        )
+    if not os.access(anchor, os.W_OK | os.X_OK):
+        _fail(f"{flag}: no permission to write inside {anchor}.")
+    if kind == "file" and path.is_file() and not os.access(path, os.W_OK):
+        _fail(f"{flag}: {path} exists and is not writable.")
+
+
+def _check_input_dir(path: Path, flag: str) -> None:
+    """Refuse an input directory that is really a file, before any work is done.
+
+    A missing directory is not an error here: both callers treat it as "nothing
+    cached yet" and either fetch or fall back. A directory that is a file is
+    never that.
+
+    Args:
+        path: What the user passed.
+        flag: The option it came from, for the message.
+
+    Raises:
+        typer.Exit: With code 1 if ``path`` exists and is not a directory.
+    """
+    if path.exists() and not path.is_dir():
+        _fail(f"{flag} takes a directory, and {path} is a file.")
 
 
 def _adaptive_note(share: float | None) -> str:
@@ -190,9 +288,10 @@ AllPanelsOption = Annotated[
     typer.Option(
         "--all-panels",
         help=(
-            "Also write one pitch-control heatmap PNG per possession loss into "
-            "this directory. The PDF always prints the top five moments; the "
-            "metric is computed at every loss, and this dumps the rest."
+            "Directory to also write one pitch-control heatmap PNG per "
+            "possession loss into; created if missing. The PDF always prints "
+            "the top five moments; the metric is computed at every loss, and "
+            "this dumps the rest -- one PNG per loss, not five."
         ),
     ),
 ]
@@ -336,13 +435,38 @@ def _load_match(tracking: Path, events: Path | None) -> tuple[pd.DataFrame, pd.D
 
 @app.command()
 def report(
-    tracking: Annotated[Path, typer.Argument(help="Tracking file, asset or match directory.")],
-    team: Annotated[str, typer.Option("--team", help="Team the report is written for.")],
-    out: Annotated[Path, typer.Option("--out", help="Destination PDF.")] = Path(
-        "out/report.pdf"
-    ),
+    tracking: Annotated[
+        Path,
+        typer.Argument(
+            help=(
+                "One of three shapes: a Metrica Sample_Game_N_RawTrackingData_*.csv, "
+                "a directory holding Metrica's Sample_Game_N/, or a .parquet tracking "
+                "asset (which needs --events)."
+            )
+        ),
+    ],
+    team: Annotated[
+        str,
+        typer.Option(
+            "--team",
+            help=(
+                "Which side the report is written for: 'home' or 'away'. Not a team "
+                "name -- tracking files do not carry one."
+            ),
+        ),
+    ],
+    out: Annotated[
+        Path, typer.Option("--out", help="Destination PDF file, not a directory.")
+    ] = Path("out/report.pdf"),
     events: Annotated[
-        Path | None, typer.Option("--events", help="Events file, when tracking is a .parquet.")
+        Path | None,
+        typer.Option(
+            "--events",
+            help=(
+                "Companion .parquet events asset. Required when TRACKING is a .parquet, "
+                "ignored for the other two shapes, which carry their own events."
+            ),
+        ),
     ] = None,
     jobs: JobsOption = None,
     rank: RankOption = "costly",
@@ -351,6 +475,11 @@ def report(
     """Build the six-page counter-press report from tracking data."""
     if team not in ("home", "away"):
         _fail(f"--team must be 'home' or 'away', got {team!r}")
+
+    # Before the match is loaded, not after the PDF is rendered.
+    _check_output_path(out, "--out", "file", "report.pdf")
+    if all_panels is not None:
+        _check_output_path(all_panels, "--all-panels", "dir")
 
     import pressing
 
@@ -395,18 +524,40 @@ def proxy(
     events: Annotated[Path, typer.Argument(help="StatsBomb events JSON for one match.")],
     team: Annotated[
         str | None,
-        typer.Option("--team", help="Only keep turnovers this team lost. Exact name."),
+        typer.Option(
+            "--team",
+            help=(
+                "Only keep turnovers this team lost. A team name spelt exactly as the "
+                "events file spells it, e.g. 'Barcelona'; a name that is not in the "
+                "match is rejected with the two that are."
+            ),
+        ),
     ] = None,
     out: Annotated[
-        Path, typer.Option("--out", help="Destination CSV of per-turnover estimates.")
+        Path,
+        typer.Option("--out", help="Destination CSV file, not a directory."),
     ] = Path("out/proxy_estimates.csv"),
     model_path: Annotated[
-        Path | None, typer.Option("--model", help="Model artefact. Defaults to the bundled one.")
+        Path | None,
+        typer.Option(
+            "--model",
+            help=(
+                "A .pkl.gz proxy artefact to score with. Defaults to the bundled "
+                "models/proxy_gbr.pkl.gz."
+            ),
+        ),
     ] = None,
 ) -> None:
-    """Estimate the counter-press metric from an events file, with no tracking."""
+    """Estimate the counter-press metric from an events file, with no tracking.
+
+    The output is an ESTIMATE, not a measurement: the header of the CSV states
+    what the model is worth and on what scale its numbers live.
+    """
     if not events.is_file():
         _fail(f"no such events file: {events}")
+    if model_path is not None and model_path.is_dir():
+        _fail(f"--model takes a model artefact, and {model_path} is a directory.")
+    _check_output_path(out, "--out", "file", "proxy_estimates.csv")
 
     from pressing import proxy as proxy_model
 
@@ -431,17 +582,24 @@ def proxy(
         estimates = estimates[estimates["losing_team"] == team]
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    header = [
-        "# pressing proxy estimates: counter-press control share per open-play turnover",
-        "# " + _statsbomb_credit(),
-        "# recovery is an ESTIMATE from an event-only model, not a measurement. The model "
+    # The phase caveat comes from proxy.recovery_phase_caveat, the same call
+    # season.py's CSV header makes, so the two outputs cannot drift apart. Until
+    # now this header hard-coded the TRACKING metric's phase means -- build-up
+    # 0.26, middle 0.47, final third 0.70 -- above a column of proxy numbers
+    # whose own gradient across the pitch is +0.078 against the tracking
+    # metric's +0.444. A reader who used that as a scale read this model's own
+    # build-up average of 0.464 as an extraordinary press.
+    lines = [
+        "pressing proxy estimates: counter-press control share per open-play turnover",
+        _statsbomb_credit(),
+        "recovery is an ESTIMATE from an event-only model, not a measurement. The model "
         "composes to r ~ 0.18 against the tracking-derived metric it stands in for; see "
         "models/MODEL_CARD.md before quoting any single value.",
-        "# recovery is driven by WHERE the ball was lost (Metrica game 1 phase means: "
-        "build-up 0.26, middle 0.47, final third 0.70). Compare only within a phase.",
-        "# epv_conceded is empty on purpose: EPV needs the opponent's control surface, "
+        *proxy_model.recovery_phase_caveat(model),
+        "epv_conceded is empty on purpose: EPV needs the opponent's control surface, "
         "which cannot be recovered from events.",
     ]
+    header = [f"# {line}" for line in lines]
     out.write_text("\n".join(header) + "\n" + estimates.to_csv(index=False))
 
     _echo(f"{len(estimates)} open-play turnovers estimated")
@@ -465,9 +623,26 @@ def _statsbomb_credit() -> str:
 
 @app.command()
 def season(
-    source: Annotated[str, typer.Option("--source", help="Event data source.")] = "statsbomb",
+    source: Annotated[
+        str,
+        typer.Option(
+            "--source",
+            help=(
+                "Event data source. 'statsbomb' is the only one built and the only "
+                "open one with both an event stream and the lineup files the "
+                "market-value join needs; anything else exits 3 without working."
+            ),
+        ),
+    ] = "statsbomb",
     competition: Annotated[
-        str, typer.Option("--competition", help="Competition name.")
+        str,
+        typer.Option(
+            "--competition",
+            help=(
+                "Competition name as StatsBomb's competitions.json spells it. A name "
+                "that matches nothing is rejected with the full list of what is there."
+            ),
+        ),
     ] = "La Liga",
     season_label: Annotated[
         str | None,
@@ -481,7 +656,11 @@ def season(
         ),
     ] = None,
     out_dir: Annotated[
-        Path, typer.Option("--out-dir", help="Directory for the csv and scatter PNG.")
+        Path,
+        typer.Option(
+            "--out-dir",
+            help="Directory for the csv and scatter PNG; created if missing.",
+        ),
     ] = Path("out"),
     limit: Annotated[
         int | None,
@@ -508,12 +687,22 @@ def season(
         bool,
         typer.Option(
             "--offline",
-            help="Never touch the network. Uses only what is already cached.",
+            help=(
+                "Never touch the network. Uses only what is already under "
+                "--cache-dir, and fails naming what is missing rather than fetching it."
+            ),
         ),
     ] = False,
     cache_dir: Annotated[
         Path,
-        typer.Option("--cache-dir", help="StatsBomb cache root, mirroring their data/ layout."),
+        typer.Option(
+            "--cache-dir",
+            help=(
+                "StatsBomb cache root, mirroring their data/ layout. Downloaded into "
+                "unless --offline. No StatsBomb data is ever committed; see the licence "
+                "note in the README."
+            ),
+        ),
     ] = Path("data/raw/statsbomb"),
     values_dir: Annotated[
         Path | None,
@@ -534,6 +723,15 @@ def season(
             "files the market-value join needs. SkillCorner ships no events at all, and "
             "Metrica is three matches.",
         )
+
+    # A season run is hundreds of HTTP requests at one per second; discovering
+    # afterwards that --out-dir names a file is the most expensive typo here.
+    _check_output_path(out_dir, "--out-dir", "dir")
+    _check_input_dir(cache_dir, "--cache-dir")
+    if not offline:
+        _check_output_path(cache_dir, "--cache-dir", "dir")
+    if values_dir is not None:
+        _check_input_dir(values_dir, "--values-dir")
 
     from pressing.season import MIN_SEASON_MATCHES, run_season
 
@@ -582,19 +780,35 @@ def season(
 
 @app.command()
 def demo(
-    out: Annotated[Path, typer.Option("--out", help="Destination PDF.")] = Path(
-        "out/demo_report.pdf"
-    ),
+    out: Annotated[
+        Path, typer.Option("--out", help="Destination PDF file, not a directory.")
+    ] = Path("out/demo_report.pdf"),
     team: Annotated[
-        str, typer.Option("--team", help="Team the report is written for.")
+        str,
+        typer.Option(
+            "--team",
+            help=(
+                "Which side the report is written for: 'home' or 'away'. Not a team "
+                "name -- the bundled Metrica match does not name its sides."
+            ),
+        ),
     ] = "home",
     jobs: JobsOption = None,
     rank: RankOption = "costly",
     all_panels: AllPanelsOption = None,
 ) -> None:
-    """Run the bundled Metrica match offline and write the full report."""
+    """Run the bundled Metrica match offline and write the full report.
+
+    No network and no arguments needed: the match ships under data/demo/.
+    """
     if team not in ("home", "away"):
         _fail(f"--team must be 'home' or 'away', got {team!r}")
+
+    # Before run_demo, not after. The whole point is that a bad --out costs
+    # nothing rather than the entire pipeline.
+    _check_output_path(out, "--out", "file", "demo_report.pdf")
+    if all_panels is not None:
+        _check_output_path(all_panels, "--all-panels", "dir")
 
     from pressing.demo import run_demo
 

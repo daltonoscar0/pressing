@@ -15,10 +15,18 @@ is an event source that has not been wired up.
 Third, that the exit codes stay meaningful. Success, "this run broke", "you
 typed it wrong" and "that feature does not exist" are four different things a
 script has to be able to tell apart.
+
+Fourth, that a destination the tool cannot write is rejected before the work
+rather than after it, and that the caveats stamped on the proxy CSV are the ones
+the repository can defend. Both were real defects: ``demo --out <a directory>``
+scored the whole match and then raised ``IsADirectoryError`` out of reportlab,
+and the proxy header printed the TRACKING metric's phase means above a column of
+proxy numbers on a different scale entirely.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -511,3 +519,377 @@ def test_demo_reports_a_missing_asset_without_a_traceback(
     assert result.exit_code == 1
     assert "bundled demo asset is missing" in result.output
     assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------- #
+# A destination that cannot be written fails before the work, not after it
+# --------------------------------------------------------------------------- #
+
+
+def test_demo_rejects_an_out_directory_without_running_the_pipeline(
+    recorder: _Recorder, tmp_path: Path
+) -> None:
+    """The defect this section exists for.
+
+    ``pressing demo --out <an existing directory>`` used to load the match,
+    score 255 of its 256 possession losses, render five panels, and only then raise
+    ``IsADirectoryError`` from reportlab's ``canvas.save`` through a 60-line
+    traceback. Measured on this machine before the fix, that cost 44.11 s of
+    user CPU to deliver a typo; after it, 0.10 s. The assertion that matters is
+    the last one: the stub pipeline was never called.
+    """
+    result = _run("demo", "--out", str(tmp_path))
+    assert result.exit_code == 1
+    assert "--out takes a file" in result.output
+    assert "is a directory" in result.output
+    # The message has to show the shape it wanted, or it only says "no".
+    assert str(tmp_path / "demo_report.pdf") in result.output
+    assert "Traceback" not in result.output
+    assert recorder.kwargs == {}
+    assert recorder.out is None
+
+
+def test_demo_rejects_an_out_path_under_a_file(recorder: _Recorder, tmp_path: Path) -> None:
+    """``Path.mkdir(parents=True)`` raises ``FileExistsError`` here, naming no flag."""
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    result = _run("demo", "--out", str(blocker / "report.pdf"))
+    assert result.exit_code == 1
+    assert "is a file, not a directory" in result.output
+    assert "Traceback" not in result.output
+    assert recorder.kwargs == {}
+
+
+def test_demo_rejects_an_all_panels_path_that_is_a_file(
+    recorder: _Recorder, tmp_path: Path
+) -> None:
+    blocker = tmp_path / "panels"
+    blocker.write_text("x")
+    result = _run("demo", "--out", str(tmp_path / "r.pdf"), "--all-panels", str(blocker))
+    assert result.exit_code == 1
+    assert "--all-panels takes a directory" in result.output
+    assert recorder.kwargs == {}
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root can write into a directory with no write bit, so there is nothing to refuse",
+)
+def test_demo_rejects_an_unwritable_destination(recorder: _Recorder, tmp_path: Path) -> None:
+    """Permission is checked with the same call the write would make."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        result = _run("demo", "--out", str(locked / "r.pdf"))
+    finally:
+        locked.chmod(0o700)
+    assert result.exit_code == 1
+    assert "no permission to write inside" in result.output
+    assert recorder.kwargs == {}
+
+
+def test_demo_accepts_a_destination_whose_directories_do_not_exist_yet(
+    recorder: _Recorder, tmp_path: Path
+) -> None:
+    """The check must not have become "the parent must already exist".
+
+    ``run_demo`` creates the parents itself, and the default ``out/`` is missing
+    on a fresh clone, so refusing a missing directory would refuse the default.
+    """
+    target = tmp_path / "a" / "b" / "r.pdf"
+    result = _run("demo", "--out", str(target))
+    assert result.exit_code == 0, result.output
+    assert Path(recorder.out) == target
+    # And nothing was created on the way past: the writer does that.
+    assert not (tmp_path / "a").exists()
+
+
+def test_report_rejects_an_out_directory_before_loading_the_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``report`` pays the same cost for the same mistake, so it gets the same guard."""
+
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the match must not be loaded when --out cannot be written")
+
+    monkeypatch.setattr("pressing.cli._load_match", never)
+    result = _run("report", str(tmp_path), "--team", "home", "--out", str(tmp_path))
+    assert result.exit_code == 1
+    assert "--out takes a file" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_report_rejects_an_all_panels_file_before_loading_the_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the match must not be loaded when --all-panels is wrong")
+
+    monkeypatch.setattr("pressing.cli._load_match", never)
+    blocker = tmp_path / "panels"
+    blocker.write_text("x")
+    result = _run(
+        "report",
+        str(tmp_path),
+        "--team",
+        "home",
+        "--out",
+        str(tmp_path / "r.pdf"),
+        "--all-panels",
+        str(blocker),
+    )
+    assert result.exit_code == 1
+    assert "--all-panels takes a directory" in result.output
+
+
+def test_season_rejects_an_out_dir_that_is_a_file_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A season run is hundreds of requests at one per second; check the path first."""
+
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("run_season must not start when --out-dir cannot be written")
+
+    monkeypatch.setattr("pressing.season.run_season", never)
+    blocker = tmp_path / "out"
+    blocker.write_text("x")
+    result = _run("season", "--offline", "--out-dir", str(blocker))
+    assert result.exit_code == 1
+    assert "--out-dir takes a directory" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("flag", ["--cache-dir", "--values-dir"])
+def test_season_rejects_an_input_directory_that_is_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, flag: str
+) -> None:
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"run_season must not start when {flag} is a file")
+
+    monkeypatch.setattr("pressing.season.run_season", never)
+    blocker = tmp_path / "cache"
+    blocker.write_text("x")
+    result = _run("season", "--offline", "--out-dir", str(tmp_path / "o"), flag, str(blocker))
+    assert result.exit_code == 1
+    assert f"{flag} takes a directory" in result.output
+
+
+def test_season_still_accepts_a_cache_directory_that_does_not_exist_yet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing is not wrong: online it gets filled, offline it fails saying what is missing."""
+    seen: dict[str, Any] = {}
+
+    def fake_run(*args: Any, **kwargs: Any) -> Any:
+        seen["cache_dir"] = kwargs.get("cache_dir")
+        raise FileNotFoundError("nothing cached for La Liga")
+
+    monkeypatch.setattr("pressing.season.run_season", fake_run)
+    missing = tmp_path / "no" / "cache" / "here"
+    result = _run("season", "--out-dir", str(tmp_path / "o"), "--cache-dir", str(missing))
+    assert result.exit_code == 1
+    assert Path(seen["cache_dir"]) == missing
+    assert "nothing cached" in result.output
+
+
+def test_proxy_rejects_an_out_directory_before_reading_the_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("events must not be read when --out cannot be written")
+
+    monkeypatch.setattr("pressing.proxy.load_statsbomb_events", never)
+    events = tmp_path / "events.json"
+    events.write_text("[]")
+    result = _run("proxy", str(events), "--out", str(tmp_path))
+    assert result.exit_code == 1
+    assert "--out takes a file" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_proxy_rejects_a_model_directory_in_words(tmp_path: Path) -> None:
+    """``gzip.open`` on a directory raised ``IsADirectoryError`` straight through."""
+    events = tmp_path / "events.json"
+    events.write_text("[]")
+    result = _run("proxy", str(events), "--model", str(tmp_path))
+    assert result.exit_code == 1
+    assert "--model takes a model artefact" in result.output
+    assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------- #
+# The proxy CSV header says only what the repository can defend
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture()
+def proxy_csv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Run ``pressing proxy`` with the real bundled model and stubbed events.
+
+    The model is real on purpose: the header quotes that artefact's own recorded
+    phase means, and a stub would let the shipped numbers drift without failing
+    anything here.
+    """
+    import pandas as pd
+
+    estimates = pd.DataFrame(
+        {
+            "match_id": [1, 1, 1],
+            "turnover_id": [0, 1, 2],
+            "losing_team": ["A", "B", "A"],
+            "phase": ["build_up", "middle", "final_third"],
+            "recovery": [0.41, 0.52, 0.55],
+            "epv_conceded": [None, None, None],
+        }
+    )
+    monkeypatch.setattr("pressing.proxy.load_statsbomb_events", lambda p: pd.DataFrame())
+    monkeypatch.setattr("pressing.proxy.predict", lambda model, frame: estimates)
+
+    events = tmp_path / "events.json"
+    events.write_text("[]")
+    out = tmp_path / "estimates.csv"
+    result = _run("proxy", str(events), "--out", str(out))
+    assert result.exit_code == 0, result.output
+    return out
+
+
+def _header_lines(path: Path) -> list[str]:
+    return [line for line in path.read_text().splitlines() if line.startswith("#")]
+
+
+def test_the_proxy_header_does_not_offer_the_tracking_phase_means_as_a_scale(
+    proxy_csv: Path,
+) -> None:
+    """The defect: proxy numbers under the tracking metric's scale.
+
+    Until now this header read "recovery is driven by WHERE the ball was lost
+    (Metrica game 1 phase means: build-up 0.26, middle 0.47, final third 0.70)"
+    above a column of proxy estimates. The proxy's own gradient across pitch
+    thirds is +0.078 against the tracking metric's +0.444, so a reader who used
+    the printed scale read this model's own build-up average -- 0.464 -- as an
+    extraordinary press. ``season`` was fixed for exactly this and ``proxy`` was
+    not. The tracking figures may still appear, but only inside the sentence
+    telling you not to scale against them.
+    """
+    from pressing import proxy as proxy_model
+
+    header = "\n".join(_header_lines(proxy_csv))
+    assert "Metrica game 1 phase means: build-up 0.26" not in header
+
+    means = proxy_model.phase_reference_means(proxy_model.load_bundled_model())
+    scale_line = next(line for line in header.splitlines() if "own phase means" in line)
+    assert f"build-up {means['build_up']:.3f}" in scale_line
+    assert f"final third {means['final_third']:.3f}" in scale_line
+    assert "0.26" not in scale_line and "0.70" not in scale_line
+    assert "Compare only within a phase" in scale_line
+
+    # Every mention of the tracking scale is a prohibition, not a reference.
+    for line in header.splitlines():
+        if "0.26 / 0.47 / 0.70" in line:
+            assert "do NOT scale these against the tracking metric" in line
+
+
+def test_the_proxy_header_is_the_shared_caveat_verbatim(proxy_csv: Path) -> None:
+    """One function writes it, so ``proxy`` and ``season`` cannot drift apart.
+
+    The previous fix corrected ``season``'s copy of this text and left
+    ``proxy``'s hard-coded one behind. Asserting equality against the source
+    rather than against a string literal is what stops that happening twice.
+    """
+    from pressing import proxy as proxy_model
+
+    expected = [f"# {line}" for line in proxy_model.recovery_phase_caveat()]
+    assert expected  # the caveat is not empty
+    assert all(line in _header_lines(proxy_csv) for line in expected)
+
+
+def test_the_proxy_and_season_headers_carry_the_same_caveat(proxy_csv: Path) -> None:
+    """Two files a reader may see side by side must not disagree about the scale."""
+    from pressing import proxy as proxy_model
+    from pressing.season import _csv_header
+
+    stats: dict[str, Any] = {
+        "n_matches_used": 380,
+        "n_matches_listed": 380,
+        "n_turnovers": 1,
+        "value_window": ("2015-08-01", "2016-06-01"),
+        "values_as_of": "2024-01-01",
+        "values_source": "snapshot",
+    }
+
+    class _Spec:
+        label = "La Liga 2015/2016"
+
+    season_header = _csv_header(_Spec(), stats)  # type: ignore[arg-type]
+    caveat = [f"# {line}" for line in proxy_model.recovery_phase_caveat()]
+    proxy_header = _header_lines(proxy_csv)
+    for line in caveat:
+        assert line in proxy_header
+        assert line in season_header
+
+
+def test_the_proxy_csv_still_reads_back_as_a_table(proxy_csv: Path) -> None:
+    """The caveat is comments, so the file is still a CSV."""
+    import pandas as pd
+
+    frame = pd.read_csv(proxy_csv, comment="#")
+    assert len(frame) == 3
+    assert "recovery" in frame.columns
+
+
+def test_the_proxy_header_keeps_its_other_warnings(proxy_csv: Path) -> None:
+    """Replacing the phase line must not have dropped the ones either side of it."""
+    header = "\n".join(_header_lines(proxy_csv))
+    assert "StatsBomb" in header
+    assert "is an ESTIMATE from an event-only model" in header
+    assert "epv_conceded is empty on purpose" in header
+
+
+# --------------------------------------------------------------------------- #
+# --help read as a new user
+# --------------------------------------------------------------------------- #
+
+
+def _help_text(command: str) -> str:
+    """One help screen as flowing prose.
+
+    rich draws the option table inside a box and wraps every help string inside
+    it, so a sentence arrives as ``"...file, not a │\\n│ directory."``. Dropping
+    the rules and collapsing the whitespace gets back the sentence a reader sees.
+    """
+    raw = _run(command, "--help").output
+    return " ".join(raw.replace("│", " ").split())
+
+
+@pytest.mark.parametrize("command", ["report", "demo"])
+def test_team_help_says_which_two_values_it_accepts(command: str) -> None:
+    """``--team`` on these two takes 'home' or 'away' and rejects anything else.
+
+    The help said only "Team the report is written for", and ``pressing proxy``
+    on the next screen takes a real team name, so the obvious reading was that
+    a name works here too. It exits 1.
+    """
+    text = _help_text(command)
+    assert "'home' or 'away'" in text
+    assert "Not a team name" in text
+
+
+def test_season_help_says_statsbomb_is_the_only_source_built() -> None:
+    """``[default: statsbomb]`` reads as one of several. It is the only one."""
+    text = _help_text("season")
+    assert "only one built" in text
+
+
+def test_report_help_names_the_three_shapes_the_argument_accepts() -> None:
+    """The old text -- "Tracking file, asset or match directory" -- named none precisely."""
+    text = _help_text("report")
+    assert "Sample_Game_N" in text
+    assert ".parquet" in text
+
+
+@pytest.mark.parametrize("command", ["report", "proxy", "demo"])
+def test_out_help_says_it_is_a_file(command: str) -> None:
+    """The flag that ate a whole run should say what it wants on the help screen."""
+    text = _help_text(command)
+    assert "file, not a directory" in text
