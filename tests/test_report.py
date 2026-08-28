@@ -36,6 +36,7 @@ import base64
 import re
 import time
 import zlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -610,9 +611,16 @@ def test_epv_grid_is_labelled_as_borrowed_not_derived(built: Path) -> None:
 
 
 def test_field_position_caveat_is_printed(built: Path) -> None:
-    """Recovery is not comparable across phases, where a coach can see it."""
-    text = pdf_prose(built)
-    assert "Read every recovery figure inside its own phase" in text
+    """Recovery is not comparable across phases, where a coach can see it.
+
+    The caveat now lives inside the cover's one boxed warning rather than in
+    the fourth of four competing caveat registers, so this asserts on the page
+    it is on as well as on the words.
+    """
+    cover = pdf_page_prose(built)[0]
+    assert "Read every recovery figure inside its own phase" in cover
+    assert report.PHASE_CAVEAT in cover
+    assert report.COVER_WARNING_HEADING in cover
 
 
 # --------------------------------------------------------------------------- #
@@ -1011,7 +1019,7 @@ def test_the_cover_states_the_regain_correlation(
     disclosure, _ = measure(tracking, losses)
     assert np.isfinite(disclosure.regain_r)
     cover = pdf_page_prose(built)[0]
-    assert "These two rows are almost unrelated" in cover
+    assert "Almost unrelated" in cover
     assert f"r = {report._signed(disclosure.regain_r, 2)}" in cover
     assert f"{disclosure.n_scored} scored losses" in cover
 
@@ -1032,7 +1040,7 @@ def test_the_cover_marks_which_direction_of_each_row_is_good(built: Path) -> Non
     cover = pdf_page_prose(built)[0]
     assert "Better is" in cover
     assert "Median time to regain" in cover
-    assert report.POLARITY_LEGEND.split(" — ")[0] in cover
+    assert report.POLARITY_LEGEND.format(shuffles=report.COVER_SHUFFLES) in cover
     # Both directions occur in the table, so neither label is dead code.
     assert report._POLARITY["recovery"] == "higher"
     assert report._POLARITY["time_to_regain"] == "lower"
@@ -1046,11 +1054,373 @@ def test_the_cover_shows_the_phase_mix_check_it_demands(
     tracking, _, losses = match
     disclosure, _ = measure(tracking, losses)
     cover = pdf_page_prose(built)[0]
-    assert "Putting both on the match's own phase mix" in cover
+    assert "On the match's own phase mix it reads" in cover
     assert report._signed(disclosure.standardised_difference, 3) in cover
     assert report._signed(disclosure.raw_difference, 3) in cover
-    verdict = "the sign survives" if disclosure.standardisation_holds else "does NOT survive"
-    assert verdict in cover
+
+
+# --------------------------------------------------------------------------- #
+# Head-to-head gaps: pages 1 and 2 get a test, not a disclaimer
+# --------------------------------------------------------------------------- #
+
+
+def test_a_gap_that_is_only_noise_is_not_called_a_gap() -> None:
+    """Two squads drawn from one distribution must not come out separated."""
+    rng = np.random.default_rng(11)
+    values = rng.normal(0.5, 0.2, 400)
+    teams = np.where(np.arange(400) % 2 == 0, "home", "away")
+    gap = report.permutation_team_gap(
+        values,
+        teams,
+        subject="home",
+        opponent="away",
+        n_shuffles=2000,
+        rng=np.random.default_rng(3),
+    )
+    assert gap.tested
+    assert not gap.separates
+    assert gap.p_value > 0.2
+    assert gap.n_subject == 200
+    assert gap.n_opponent == 200
+
+
+def test_a_real_gap_is_found() -> None:
+    """A planted half-sigma offset has to clear the same null the noise failed."""
+    rng = np.random.default_rng(12)
+    teams = np.where(np.arange(400) % 2 == 0, "home", "away")
+    values = rng.normal(0.5, 0.2, 400) + np.where(teams == "home", 0.1, 0.0)
+    gap = report.permutation_team_gap(
+        values,
+        teams,
+        subject="home",
+        opponent="away",
+        n_shuffles=2000,
+        rng=np.random.default_rng(4),
+    )
+    assert gap.separates
+    assert gap.p_value < 0.01
+    assert gap.difference > 0.05
+
+
+def test_the_stratified_design_removes_a_gap_that_is_only_phase_mix() -> None:
+    """The point of stratifying, stated as a test.
+
+    Two squads that press identically inside every phase, but lose the ball in
+    different places, differ substantially when the phases are pooled. The
+    unstratified null -- the one behind the cover's Difference column -- is
+    entitled to call that a difference, because it is one. The stratified null
+    must not, because within a phase there is nothing there, and the cover
+    prints the stratified p beside the standardised number for exactly this
+    reason.
+    """
+    phases = np.array(["build_up"] * 100 + ["final_third"] * 100)
+    # Home loses it high, away loses it low; the phase means are identical.
+    teams = np.where(
+        phases == "build_up",
+        np.where(np.arange(200) % 5 == 0, "home", "away"),
+        np.where(np.arange(200) % 5 == 0, "away", "home"),
+    )
+    rng = np.random.default_rng(13)
+    values = np.where(phases == "build_up", 0.25, 0.70) + rng.normal(0, 0.02, 200)
+
+    pooled = report.permutation_team_gap(
+        values,
+        teams,
+        subject="home",
+        opponent="away",
+        n_shuffles=2000,
+        rng=np.random.default_rng(5),
+    )
+    conditional = report.permutation_team_gap(
+        values,
+        teams,
+        subject="home",
+        opponent="away",
+        strata=phases,
+        n_shuffles=2000,
+        rng=np.random.default_rng(5),
+    )
+    assert pooled.separates, "pooling two different phases must show the phase mix"
+    assert abs(pooled.difference) > 0.2
+    assert conditional.stratified and not pooled.stratified
+    assert not conditional.separates, "inside a phase the squads are identical"
+    assert abs(conditional.difference) < 0.02
+
+
+def test_a_gap_with_too_few_losses_is_not_tested_rather_than_guessed() -> None:
+    """A mean of two against a mean of one gets no p-value."""
+    gap = report.permutation_team_gap(
+        np.array([0.4, 0.6, 0.5]),
+        np.array(["home", "home", "away"]),
+        subject="home",
+        opponent="away",
+        n_shuffles=500,
+        rng=np.random.default_rng(6),
+    )
+    assert not gap.tested
+    assert np.isfinite(gap.difference)
+    assert report._gap_cell(gap) == report.GAP_UNTESTED
+
+
+@pytest.mark.parametrize("bad", [{"n_shuffles": 0}, {"statistic": "mode"}])
+def test_permutation_team_gap_rejects_a_design_it_cannot_run(bad: dict[str, Any]) -> None:
+    """A misspelled statistic must raise, not silently become the mean."""
+    with pytest.raises(ValueError):
+        report.permutation_team_gap(
+            np.arange(10, dtype=float),
+            np.array(["home"] * 5 + ["away"] * 5),
+            subject="home",
+            opponent="away",
+            **bad,
+        )
+
+
+def test_every_cover_row_carries_a_p_value_or_says_it_was_not_tested(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """The finding that forced this round: no row may go out unqualified.
+
+    Page 1 used to print a bolded head-to-head whose only statement about
+    uncertainty was the confession that no gap in it had been tested against
+    chance, while the machinery to test it sat three modules away. Every row
+    now carries either a measured p-value or the words "not tested", and this
+    asserts on the rendered page rather than on the dictionary behind it.
+    """
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    cover = pdf_page_prose(built)[0]
+    assert "vs chance" in cover
+    assert report.GAP_UNTESTED in cover, "the untestable count rows must say so"
+    tested = [gap for gap in disclosure.cover_gaps.values() if gap.tested]
+    assert tested, "the fixture must produce at least one testable row"
+    for key in ("recovery", "regain"):
+        gap = disclosure.cover_gaps[key]
+        assert gap.tested, f"the {key} row is the whole point and must be tested"
+        assert report._gap_cell(gap) in cover
+
+
+#: Column index of the cover table's Difference cell, which is the one styled
+#: by the test result rather than by the metric.
+DIFFERENCE_COLUMN = 3
+
+
+def kpi_difference_style(
+    losses: pd.DataFrame,
+    tracking: pd.DataFrame,
+    disclosure: report.Disclosure,
+    gaps: dict[str, report.TeamGap],
+) -> tuple[str, Any]:
+    """Face and colour of the recovery row's Difference cell, as drawn.
+
+    reportlab resolves ``FONT`` and ``TEXTCOLOR`` into per-cell styles rather
+    than keeping the command list, and that resolved style is what the page
+    actually draws, so it is what the test reads.
+
+    Args:
+        losses: Scored losses.
+        tracking: Canonical tracking frame.
+        disclosure: The measured disclosure to base the table on.
+        gaps: Gap results to substitute for the measured ones.
+
+    Returns:
+        ``(fontname, colour)`` of the recovery row's Difference cell.
+    """
+    fonts = report.register_pdf_fonts()
+    table = report._kpi_table(
+        report.with_expected_recovery(losses, tracking),
+        "home",
+        None,
+        report._build_styles(*fonts),
+        fonts,
+        replace(disclosure, cover_gaps=gaps),
+    )
+    cell = table._cellStyles[1][DIFFERENCE_COLUMN]
+    return cell.fontname, cell.color
+
+
+def test_a_gap_consistent_with_chance_is_rendered_differently(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+) -> None:
+    """Grey and unbolded for noise; black and bold for a finding.
+
+    A text-layer check cannot see a colour, and the whole point of the styling
+    rule is that a gap the match cannot separate from chance must not look like
+    a result. So this drives one real table twice, changing nothing but the
+    p-value, and reads the resolved cell style off the flowable.
+    """
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    assert "recovery" in disclosure.cover_gaps
+
+    def at(p_value: float) -> tuple[str, Any]:
+        """The Difference cell's style when every gap lands at ``p_value``."""
+        return kpi_difference_style(
+            losses,
+            tracking,
+            disclosure,
+            {
+                key: replace(gap, p_value=p_value, difference=0.05, n_shuffles=100)
+                for key, gap in disclosure.cover_gaps.items()
+            },
+        )
+
+    noise_font, noise_colour = at(0.90)
+    finding_font, finding_colour = at(0.001)
+    assert noise_colour is report._INK_MUTED, "a gap consistent with chance must be greyed"
+    assert noise_font != finding_font, "the two must not be drawn in the same face"
+    assert finding_font == report.FONT_BOLD
+    assert finding_colour is not report._INK_MUTED
+
+
+def test_the_phase_table_tests_every_row(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """Page 2's phase table prints a gap and a p-value for each phase."""
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    page = pdf_page_prose(built)[1]
+    assert disclosure.phase_gaps, "the fixture must produce at least one phase gap"
+    for phase, gap in disclosure.phase_gaps.items():
+        assert report._signed(gap.difference, 3) in page, f"{phase} lost its gap"
+        assert report._gap_cell(gap) in page, f"{phase} lost its p-value"
+
+
+def test_the_one_phase_that_clears_its_null_is_distinguishable(
+    tmp_path: Path,
+) -> None:
+    """The finding this round exists to rescue, driven both ways.
+
+    On the bundled match exactly one comparison in the whole document survives
+    its own null -- the middle-third recovery gap -- and it was printed with the
+    same weight as a final-third row at p = 0.85. Here a match is built where
+    one phase carries a large planted gap and the others carry none, and the
+    page is required to name that phase and no other.
+    """
+    tracking = make_tracking(n_players=6, n_frames=2400)
+    losses = make_losses(tracking, n=90)
+    phase = losses["phase"].to_numpy(dtype=object)
+    side = losses["losing_team"].to_numpy(dtype=object)
+    rng = np.random.default_rng(21)
+    base = {"build_up": 0.25, "middle": 0.50, "final_third": 0.70}
+    recovery = np.array([base.get(str(name), 0.5) for name in phase])
+    recovery = recovery + rng.normal(0, 0.02, len(losses))
+    # Only the middle third separates the squads, and it separates them hugely.
+    recovery += np.where((phase == "middle") & (side == "home"), 0.20, 0.0)
+    losses = losses.assign(recovery=recovery, recovery_area=recovery)
+
+    path = report.build_report(
+        tracking, losses, "home", tmp_path / "planted.pdf", grid=TEST_GRID
+    )
+    disclosure, _ = measure(tracking, losses)
+    clear = [name for name, gap in disclosure.phase_gaps.items() if gap.separates]
+    assert clear == ["middle"], f"only the middle third was planted, got {clear}"
+    page = pdf_page_prose(path)[1]
+    assert "One row here is not like the others" in page
+    assert "in the middle, Home by" in page
+    assert "after correcting for the 3 phases tested" in page
+    for quiet in ("build up", "final third"):
+        assert f"in the {quiet}, " not in page
+
+
+def test_a_match_where_nothing_separates_says_nothing_separated(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """The verdict line has to work in the direction the data actually goes."""
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    tested = [gap for gap in disclosure.phase_gaps.values() if gap.tested]
+    page = pdf_page_prose(built)[1]
+    if tested and not any(gap.separates for gap in tested):
+        assert "is bigger than reshuffling" in page
+        assert "the two squads press alike" in page
+
+
+def test_page_six_says_the_metric_is_not_a_regain(
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], built: Path
+) -> None:
+    """Page 6 leaves the building alone, so it has to carry this itself.
+
+    The column is headed "Recovery". The r(recovery, regain) note lived on the
+    cover only, so a reader handed page 6 on its own could still read a high
+    number as a claim that the ball came back.
+    """
+    tracking, _, losses = match
+    disclosure, _ = measure(tracking, losses)
+    page = pdf_page_prose(built)[5]
+    assert np.isfinite(disclosure.regain_r)
+    assert "It is also not a regain" in page
+    assert f"r = {report._signed(disclosure.regain_r, 2)}" in page
+    assert "not that the ball came back" in page
+
+
+def test_page_six_p_values_describe_the_cells_the_reader_can_see(
+    busy: tuple[pd.DataFrame, pd.DataFrame],
+) -> None:
+    """A p-value in a column heading is computed over that column's own rows.
+
+    The test's own default is five losses per player; the table prints at
+    eleven. A heading that ran the test at five described a population the
+    table refuses to show -- on the bundled match the Build up heading printed
+    a p-value over fourteen players in a column where every cell read n<11.
+    """
+    tracking, losses = busy
+    disclosure, players = measure(tracking, losses)
+    assert disclosure.permutation_min_count == disclosure.min_losses
+    assert disclosure.permutation_min_count > baseline.MIN_LOSSES_FOR_PLAYER - 1
+    for phase, printed in disclosure.phase_printed.items():
+        if printed == 0:
+            assert not np.isfinite(disclosure.phase_p.get(phase, float("nan"))), (
+                f"{phase} prints nothing, so it must carry no p-value"
+            )
+
+
+@pytest.mark.parametrize("fixture", ["thin", "busy"])
+def test_page_six_names_both_populations_of_the_position_check(
+    fixture: str,
+    match: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    built: Path,
+    busy: tuple[pd.DataFrame, pd.DataFrame],
+    built_busy: Path,
+) -> None:
+    """The wider figure is the better estimate; the narrower one is checkable.
+
+    Both fixtures matter. On the busy one some rows print and some do not, so
+    the two populations differ and the page has to name both. On the thin one
+    nothing prints at all, so the narrower figure does not exist and the clause
+    has to be absent rather than computed over zero rows.
+    """
+    tracking, losses = (busy if fixture == "busy" else (match[0], match[2]))
+    path = built_busy if fixture == "busy" else built
+    disclosure, _ = measure(tracking, losses)
+    page = pdf_page_prose(path)[5]
+    assert f"over {disclosure.position_rows} players" in page
+    if (
+        np.isfinite(disclosure.position_r_printed)
+        and disclosure.position_rows_printed
+        and disclosure.position_rows_printed != disclosure.position_rows
+    ):
+        assert f"over the {disclosure.position_rows_printed} of them" in page
+        assert f"r = {report._signed(disclosure.position_r_printed, 2)}" in page
+    else:
+        # Nothing prints a value, so the narrower figure does not exist and the
+        # clause is left out rather than filled with a number over zero rows.
+        assert "of them whose Recovery cell below" not in page
+
+
+def test_gaps_survive_a_match_with_one_loss(tmp_path: Path) -> None:
+    """A degenerate match prints six pages and no invented p-value."""
+    tracking = make_tracking(n_players=2, n_frames=400)
+    losses = make_losses(tracking, n=1)
+    path = report.build_report(
+        tracking, losses, "home", tmp_path / "one.pdf", grid=TEST_GRID
+    )
+    assert page_count(path) == report.N_PAGES
+    disclosure, _ = measure(tracking, losses)
+    assert not any(gap.tested for gap in disclosure.cover_gaps.values())
+    assert not any(gap.tested for gap in disclosure.phase_gaps.values())
+    pages = pdf_page_prose(path)
+    assert report.GAP_UNTESTED in pages[0]
+    assert "p = " not in pages[0]
 
 
 def test_the_unscored_footnote_agrees_with_the_map(tmp_path: Path) -> None:

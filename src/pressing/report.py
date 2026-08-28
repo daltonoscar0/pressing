@@ -125,7 +125,7 @@ overflowing page reads as a slightly smaller page instead of a broken one.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final, Literal
 from xml.sax.saxutils import escape
@@ -187,11 +187,17 @@ from pressing.possession import POSSESSION_TYPES
 __all__ = [
     "BOTTOM_MARGIN",
     "DATA_CREDIT",
+    "COVER_SHUFFLES",
+    "COVER_WARNING_HEADING",
     "DPI",
     "EPV_PROVENANCE",
     "FRAME_H",
     "FRAME_W",
+    "GAP_ALPHA",
+    "GAP_UNTESTED",
+    "GAP_UNTESTED_GLOSS",
     "MARGIN",
+    "MIN_GAP_LOSSES",
     "MIN_PERMUTATION_GROUPS",
     "MOMENT_OFFSETS",
     "N_PAGES",
@@ -208,10 +214,14 @@ __all__ = [
     "Disclosure",
     "Moment",
     "MomentFrame",
+    "TeamGap",
     "build_report",
     "cover_page",
     "loss_map_page",
+    "measure_cover_gaps",
     "measure_disclosure",
+    "measure_phase_gaps",
+    "permutation_team_gap",
     "moment_detail_page",
     "moment_pages",
     "player_table_page",
@@ -307,15 +317,20 @@ EPV_PROVENANCE: Final[str] = (
     "reference surface reproduced here, not an estimate this tool derived."
 )
 
-#: The caveat that keeps the headline number from being misread. Printed on the
-#: cover beside the KPI table and again under the phase table.
+#: The caveat that keeps the headline number from being misread, printed inside
+#: the cover's one boxed warning.
+#:
+#: Six sentences long until the cover was restructured. The long version spelled
+#: out the mechanism -- lose the ball in your own build-up and your team is
+#: compressed around its own goal while the opponent occupies everything else --
+#: which is worth saying once and was being said in the fourth of four competing
+#: caveat registers, where an audit measured that nobody was reading it. The
+#: mechanism is now shown rather than described, by the phase bars directly
+#: below and by page 2's phase table; this is the instruction that goes with
+#: them.
 PHASE_CAVEAT: Final[str] = (
-    "Read every recovery figure inside its own phase. The dominant driver of this "
-    "metric is where the ball was lost, not how hard anyone pressed: lose it in "
-    "your own build-up and your team is compressed around its own goal while the "
-    "opponent occupies everything else, and the share is small for reasons that "
-    "have nothing to do with the press. A build-up recovery and a final-third "
-    "recovery are different scales and must not be subtracted from one another."
+    "Read every recovery figure inside its own phase: a build-up recovery and a "
+    "final-third recovery are different scales and must never be subtracted."
 )
 
 #: The page-6 heading a reader has to walk past to reach the squad table.
@@ -349,6 +364,48 @@ PERMUTATION_SEED: Final[int] = 20260826
 #: Below this the null is built from so few groups that the statistic is not
 #: worth putting on paper.
 MIN_PERMUTATION_GROUPS: Final[int] = 3
+
+#: Shuffles behind every team-versus-team gap on pages 1 and 2.
+#:
+#: Larger than :data:`PERMUTATION_SHUFFLES` because these p-values are the ones
+#: a reader acts on -- they sit beside the six numbers the cover bolds -- and
+#: because one of them lands near the threshold that decides how the number is
+#: styled. At 5,000 shuffles the page-2 middle-third gap rests on about 31
+#: exceedances; at 20,000 it rests on about 126, and the third decimal place
+#: stops moving between seeds.
+COVER_SHUFFLES: Final[int] = 20000
+
+#: The line between a gap this match can distinguish from chance and one it
+#: cannot.
+#:
+#: Not a claim that 0.05 is meaningful in itself. It is the threshold that
+#: decides *typography*: at or above it the Difference is greyed and the page
+#: says the match cannot tell it from chance, below it the Difference is set in
+#: ink. Making the styling follow a stated rule is what stops a coloured delta
+#: reading as a verdict.
+GAP_ALPHA: Final[float] = 0.05
+
+#: Fewest losses each side needs before a head-to-head gap is tested at all.
+#:
+#: The permutation test is exact at any size, but a gap between a mean of two
+#: losses and a mean of one is not worth a p-value; the cell says the gap was
+#: not tested instead, which is a fact about the match rather than a number
+#: with no power behind it.
+MIN_GAP_LOSSES: Final[int] = 3
+
+#: Shuffles held in memory at once by :func:`permutation_team_gap`. The
+#: statistic vectorises across shuffles, which is what makes 20,000 of them
+#: affordable inside a report build; materialising all of them at once would
+#: cost tens of megabytes for no further gain.
+_GAP_CHUNK: Final[int] = 2000
+
+#: Slack when counting how many shuffles matched or beat the observed gap.
+#:
+#: The observed arrangement is one of the arrangements the null draws from, so
+#: it will be drawn, and floating-point summation orders it either side of
+#: itself. Without this the p-value depends on the order numpy happened to add
+#: a few dozen doubles in.
+_GAP_TOLERANCE: Final[float] = 1e-12
 
 #: What "nearby" means in the player table.
 NEARBY_GLOSS: Final[str] = (
@@ -747,6 +804,15 @@ class Disclosure:
             player's credited losses. NaN when it cannot be fitted.
         position_rho: The same comparison as a rank correlation.
         position_rows: Players both columns exist for.
+        position_r_printed: The same correlation over only the players whose
+            Recovery cell actually prints a number. ``position_r`` is measured
+            over every credited player, which is the better estimate of the
+            metric but is a larger population than the column the reader can
+            see, so page 6 states both and names each population.
+        position_rows_printed: Players behind ``position_r_printed``.
+        permutation_min_count: Losses a player needs before entering a phase
+            permutation test. Held equal to ``min_losses`` so a p-value in a
+            column heading describes exactly the cells beneath it.
         printed_rows: Rows the page-6 tables print.
         suppressed_rows: How many of them have too few losses to show a value.
         min_losses: The suppression threshold,
@@ -768,6 +834,11 @@ class Disclosure:
         phase_printed: How many of the printed rows actually show a value in
             each phase column. A column that prints nothing is a fact about the
             match the page has to state, not a blank the reader has to notice.
+        cover_gaps: One :class:`TeamGap` per tested cover row, keyed as
+            :data:`_POLARITY` is, plus ``"recovery_standardised"``. The cover
+            prints each p-value beside the number it belongs to; a row with no
+            entry here prints an explicit not-tested marker instead.
+        phase_gaps: The same, one per pitch phase, for page 2's table.
         raw_difference: Subject team's pooled recovery minus the opponent's, as
             the cover prints it.
         standardised_difference: The same difference with both teams reweighted
@@ -795,6 +866,9 @@ class Disclosure:
     position_r: float = float("nan")
     position_rho: float = float("nan")
     position_rows: int = 0
+    position_r_printed: float = float("nan")
+    position_rows_printed: int = 0
+    permutation_min_count: int = baseline.MIN_LOSSES_FOR_PLAYER
     printed_rows: int = 0
     suppressed_rows: int = 0
     min_losses: int = baseline.MIN_LOSSES_FOR_PLAYER
@@ -808,6 +882,8 @@ class Disclosure:
     phase_p: dict[str, float] = field(default_factory=dict)
     phase_residual_p: dict[str, float] = field(default_factory=dict)
     phase_printed: dict[str, int] = field(default_factory=dict)
+    cover_gaps: dict[str, TeamGap] = field(default_factory=dict)
+    phase_gaps: dict[str, TeamGap] = field(default_factory=dict)
     raw_difference: float = float("nan")
     standardised_difference: float = float("nan")
     standardised: dict[str, float] = field(default_factory=dict)
@@ -930,10 +1006,325 @@ def _position_only_prediction(losses: pd.DataFrame, tracking: pd.DataFrame) -> n
         return np.full(len(losses), np.nan)
 
 
+@dataclass(frozen=True)
+class TeamGap:
+    """One head-to-head difference, and whether this match can tell it from chance.
+
+    The cover and the phase table print gaps between two squads. Every one of
+    them is an ordinary difference of two averages over a few dozen turnovers,
+    and until this existed the only thing either page said about that was that
+    nobody had looked. This is the result of looking.
+
+    Attributes:
+        subject: Team the difference is measured *from*.
+        opponent: Team it is measured *to*. The difference is subject minus
+            opponent, so its sign reads the same way the cover's column does.
+        difference: The gap, in the metric's own units.
+        p_value: Two-sided permutation p-value, or NaN when the gap was not
+            tested. See :func:`permutation_team_gap` for the null.
+        n_subject: Losses behind the subject's side of the gap.
+        n_opponent: Losses behind the opponent's side.
+        n_shuffles: Shuffles behind ``p_value``.
+        stratified: Whether values were only ever permuted inside a pitch
+            phase. False for the raw pooled gap the cover prints, True for the
+            phase-standardised gap the cover's own arithmetic check prints.
+    """
+
+    subject: str = ""
+    opponent: str = ""
+    difference: float = float("nan")
+    p_value: float = float("nan")
+    n_subject: int = 0
+    n_opponent: int = 0
+    n_shuffles: int = 0
+    stratified: bool = False
+
+    @property
+    def tested(self) -> bool:
+        """Whether a p-value was actually produced for this gap."""
+        return bool(np.isfinite(self.p_value))
+
+    @property
+    def separates(self) -> bool:
+        """Whether the gap is further from zero than chance readily manages."""
+        return self.tested and self.p_value < GAP_ALPHA
+
+
+def permutation_team_gap(
+    values: np.ndarray | pd.Series,
+    teams: np.ndarray | pd.Series,
+    *,
+    subject: str,
+    opponent: str,
+    strata: np.ndarray | pd.Series | None = None,
+    statistic: str = "mean",
+    n_shuffles: int = COVER_SHUFFLES,
+    minimum: int = MIN_GAP_LOSSES,
+    rng: np.random.Generator | None = None,
+) -> TeamGap:
+    """Test whether two squads differ by more than shuffling the labels manages.
+
+    The sibling of :func:`pressing.baseline.permutation_between_player`, for
+    the one comparison that function cannot make. That routine asks whether a
+    *column* spreads players apart; this asks whether a *pair* of numbers is
+    further apart than chance, which is what pages 1 and 2 actually print.
+
+    The null is that the losing team's identity tells you nothing about the
+    value: each loss keeps its value, the labels are reshuffled, and each
+    squad keeps the number of losses it really had. The statistic is the same
+    difference of two averages the page prints, so the p-value belongs to the
+    number beside it and not to some adjusted cousin of it.
+
+    **Stratification.** Pass ``strata`` -- the pitch phase -- and values are
+    only ever permuted inside a phase, and the statistic becomes the *phase
+    -standardised* gap: the within-phase difference, averaged over phases with
+    each phase weighted by its share of the losses. The two designs answer
+    different questions and this module prints both, each next to the number it
+    belongs to, because on the bundled match they disagree.
+
+    Unstratified, the null is "the label is worth nothing at all", and the
+    statistic is the raw pooled gap. That is exactly the number the cover's
+    Difference column shows, and it is the only null under which that number
+    has an expected value of zero, so it is the p-value the cover prints.
+
+    Stratified, the statistic is centred on zero by construction and the
+    question narrows to "within a phase, does the label still predict?" -- the
+    only comparison :data:`PHASE_CAVEAT` permits. That is not the pooled number
+    in the Difference column, it is the standardised number the cover's own
+    arithmetic check prints two lines below, so that is where its p-value goes.
+
+    What must not happen is running both against the raw pooled gap and
+    printing whichever came out smaller. Permuting inside a phase leaves the
+    raw pooled gap with a *non-zero* null centre -- the phase-mix effect -- so
+    comparing it against zero is not a two-sided test of anything, and it is
+    the combination that gives the smallest number of the three.
+
+    Args:
+        values: Per-loss values, one per row.
+        teams: Losing team per row, the same length.
+        subject: The team the difference is measured from.
+        opponent: The team it is measured to.
+        strata: Optional block label per row. See above.
+        statistic: ``"mean"`` or ``"median"``, matching whatever the page's own
+            aggregate does to the same column.
+        n_shuffles: Shuffles.
+        minimum: Fewest rows each side needs before the test is run at all.
+        rng: Random generator, for reproducibility.
+
+    Returns:
+        A :class:`TeamGap`. When either side is below ``minimum`` the
+        difference is still reported, if it exists, and ``p_value`` is NaN --
+        the page then says the gap was not tested rather than printing a
+        p-value with nothing behind it.
+
+    Raises:
+        ValueError: If the inputs differ in length, if ``n_shuffles`` is below
+            one, or if ``statistic`` is not one of the two allowed names.
+    """
+    if n_shuffles < 1:
+        raise ValueError(f"n_shuffles must be at least 1, got {n_shuffles}")
+    if statistic not in ("mean", "median"):
+        raise ValueError(f"statistic must be 'mean' or 'median', got {statistic!r}")
+    data = pd.to_numeric(pd.Series(values).reset_index(drop=True), errors="coerce").to_numpy(
+        dtype=np.float64
+    )
+    labels = pd.Series(teams).reset_index(drop=True).astype(object).to_numpy()
+    if labels.shape[0] != data.shape[0]:
+        raise ValueError(f"values and teams differ in length: {data.shape[0]} vs {labels.shape[0]}")
+    if strata is None:
+        blocks = np.zeros(data.shape[0], dtype=object)
+    else:
+        blocks = pd.Series(strata).reset_index(drop=True).astype(object).to_numpy()
+        if blocks.shape[0] != data.shape[0]:
+            raise ValueError(
+                f"values and strata differ in length: {data.shape[0]} vs {blocks.shape[0]}"
+            )
+
+    keep = np.isfinite(data) & np.isin(labels, (subject, opponent))
+    if strata is not None:
+        keep &= pd.notna(pd.Series(blocks)).to_numpy()
+    data, labels, blocks = data[keep], labels[keep], blocks[keep]
+    mine = labels == subject
+    n_subject, n_opponent = int(mine.sum()), int((~mine).sum())
+    empty = TeamGap(
+        subject=subject,
+        opponent=opponent,
+        n_subject=n_subject,
+        n_opponent=n_opponent,
+        n_shuffles=0,
+        stratified=strata is not None,
+    )
+    if n_subject == 0 or n_opponent == 0:
+        return empty
+
+    codes, _ = pd.factorize(pd.Series(blocks, dtype="object"))
+    slots = [np.flatnonzero(codes == block) for block in range(int(codes.max()) + 1)]
+    # A phase only one squad ever lost the ball in carries no within-phase
+    # comparison, so it is dropped and the remaining weights renormalised.
+    # Which phases those are is fixed by the labels, which the shuffle never
+    # moves, so this is decided once rather than inside the loop.
+    usable = [slot for slot in slots if mine[slot].any() and (~mine[slot]).any()]
+    if not usable:
+        return empty
+    sizes = np.array([slot.size for slot in usable], dtype=np.float64)
+    weights = sizes / sizes.sum()
+    reduce = np.mean if statistic == "mean" else np.median
+
+    def compute(sample: np.ndarray) -> np.ndarray:
+        """The statistic for each row of a ``(shuffles, losses)`` matrix."""
+        if strata is None:
+            return reduce(sample[:, mine], axis=1) - reduce(sample[:, ~mine], axis=1)
+        total = np.zeros(sample.shape[0], dtype=np.float64)
+        for weight, slot in zip(weights, usable, strict=True):
+            here = sample[:, slot]
+            total += weight * (
+                reduce(here[:, mine[slot]], axis=1) - reduce(here[:, ~mine[slot]], axis=1)
+            )
+        return total
+
+    difference = float(compute(data[None, :])[0])
+    if min(n_subject, n_opponent) < minimum:
+        return replace(empty, difference=difference)
+
+    generator = np.random.default_rng() if rng is None else rng
+    exceed = 0
+    done = 0
+    # Chunked rather than one 20,000-row matrix: the statistic vectorises over
+    # shuffles, which is what makes this affordable at all, but a full matrix
+    # of a two-match frame would be tens of megabytes for no gain.
+    while done < n_shuffles:
+        chunk = min(_GAP_CHUNK, n_shuffles - done)
+        block = np.tile(data, (chunk, 1))
+        if strata is None:
+            block = generator.permuted(block, axis=1)
+        else:
+            for slot in slots:
+                block[:, slot] = generator.permuted(block[:, slot], axis=1)
+        null = compute(block)
+        # The tolerance is there because the observed value is one of the
+        # arrangements the null draws from, and floating-point summation makes
+        # an identical arrangement compare as very slightly larger or smaller.
+        exceed += int(np.count_nonzero(np.abs(null) >= abs(difference) - _GAP_TOLERANCE))
+        done += chunk
+    return TeamGap(
+        subject=subject,
+        opponent=opponent,
+        difference=difference,
+        p_value=float((exceed + 1) / (n_shuffles + 1)),
+        n_subject=n_subject,
+        n_opponent=n_opponent,
+        n_shuffles=n_shuffles,
+        stratified=strata is not None,
+    )
+
+
+def measure_cover_gaps(
+    losses: pd.DataFrame,
+    team: str,
+    *,
+    n_shuffles: int = COVER_SHUFFLES,
+) -> dict[str, TeamGap]:
+    """Test every head-to-head number the cover prints.
+
+    Each row is tested over exactly the losses its own aggregate averages,
+    which is not the same set for every row: ``mean_recovery`` and the EPV
+    swing are means over scored losses, while the regain rate and the median
+    time to regain are taken over every loss, scored or not. Shuffling a
+    population the printed number was not computed from would produce a
+    p-value for a different statistic.
+
+    Two rows are absent by design. Possession losses is a count, and the null
+    here holds every squad's loss count fixed, so there is nothing left to
+    shuffle; the halves row prints no difference at all. Both say so on the
+    page rather than borrowing a neighbour's p-value.
+
+    Args:
+        losses: Scored losses.
+        team: The subject team.
+        n_shuffles: Shuffles per test.
+
+    Returns:
+        ``{key: TeamGap}`` keyed by the same names as :data:`_POLARITY`, plus
+        ``"recovery_standardised"`` for the phase-stratified companion to the
+        recovery row. Empty when the match has no opponent to compare against.
+    """
+    if losses.empty or "losing_team" not in losses.columns:
+        return {}
+    opponent = "away" if team == "home" else "home"
+    scored = losses[losses["scored"].fillna(False).to_numpy(dtype=bool)]
+    out: dict[str, TeamGap] = {}
+
+    def run(key: str, frame: pd.DataFrame, column: str, statistic: str, **kw: Any) -> None:
+        """Run one gap test, or skip the row when its column is not present."""
+        if column not in frame.columns:
+            return
+        out[key] = permutation_team_gap(
+            frame[column],
+            frame["losing_team"],
+            subject=team,
+            opponent=opponent,
+            statistic=statistic,
+            n_shuffles=n_shuffles,
+            rng=np.random.default_rng(PERMUTATION_SEED),
+            **kw,
+        )
+
+    run("recovery", scored, "recovery", "mean")
+    run("regain", losses, "regained_within_5s", "mean")
+    run("epv", scored, "epv_conceded", "mean")
+    run("time_to_regain", losses, "time_to_regain", "median")
+    if "phase" in scored.columns:
+        run("recovery_standardised", scored, "recovery", "mean", strata=scored["phase"])
+    return out
+
+
+def measure_phase_gaps(
+    losses: pd.DataFrame,
+    team: str,
+    *,
+    n_shuffles: int = COVER_SHUFFLES,
+) -> dict[str, TeamGap]:
+    """Test the two-team recovery gap inside each pitch phase.
+
+    No stratification question arises here: the test is already inside one
+    phase, so the confounder the cover has to argue about is held fixed by the
+    table's own layout.
+
+    Args:
+        losses: Scored losses.
+        team: The subject team, so the sign of each gap reads the same way the
+            cover's does.
+        n_shuffles: Shuffles per test.
+
+    Returns:
+        ``{phase: TeamGap}`` for every phase with losses in it.
+    """
+    if losses.empty or "phase" not in losses.columns:
+        return {}
+    opponent = "away" if team == "home" else "home"
+    scored = losses[losses["scored"].fillna(False).to_numpy(dtype=bool)]
+    out: dict[str, TeamGap] = {}
+    for phase in PHASES:
+        block = scored[scored["phase"] == phase]
+        if block.empty:
+            continue
+        out[phase] = permutation_team_gap(
+            block["recovery"],
+            block["losing_team"],
+            subject=team,
+            opponent=opponent,
+            n_shuffles=n_shuffles,
+            rng=np.random.default_rng(PERMUTATION_SEED),
+        )
+    return out
+
+
 def _permutation_p(
     values: pd.Series,
     groups: pd.Series,
     strata: pd.Series,
+    *,
+    min_count: int,
 ) -> float:
     """Run one between-player permutation test and return its p-value.
 
@@ -942,6 +1333,10 @@ def _permutation_p(
         groups: Player key per loss.
         strata: Block label per loss, normally the team, so that a squad-level
             offset can never be shuffled into looking like a player effect.
+        min_count: Fewest losses a player needs to enter the test. Page 6
+            passes its own printing threshold, so the p-value in a column
+            heading describes exactly the players whose cells are under it and
+            not a wider population the table refuses to show.
 
     Returns:
         The p-value, or NaN when too few players clear the test's own minimum.
@@ -953,6 +1348,7 @@ def _permutation_p(
         groups,
         strata=strata,
         n_shuffles=PERMUTATION_SHUFFLES,
+        min_count=min_count,
         rng=np.random.default_rng(PERMUTATION_SEED),
     )
     if result.n_groups < MIN_PERMUTATION_GROUPS:
@@ -1111,8 +1507,8 @@ def measure_disclosure(
             key=joined["team"].astype(str) + "/" + joined["player_id"].astype(str)
         )
 
-    position_r = position_rho = float("nan")
-    position_rows = 0
+    position_r = position_rho = position_r_printed = float("nan")
+    position_rows = position_rows_printed = 0
     prediction = _position_only_prediction(losses, tracking)
     if len(joined) and np.isfinite(prediction).any() and not shown.empty:
         lookup = pd.Series(prediction, index=losses["loss_id"].to_numpy())
@@ -1120,29 +1516,53 @@ def measure_disclosure(
             position_only=joined["loss_id"].map(lookup).to_numpy(dtype=np.float64)
         ).groupby(["team", "player_id"], observed=True)
         pooled = by_player.agg(observed=("recovery", "mean"), predicted=("position_only", "mean"))
-        keys = shown.set_index(["team", "player_id"]).index
-        pooled = pooled.loc[pooled.index.intersection(keys)]
-        observed = pooled["observed"].to_numpy(dtype=np.float64)
-        predicted = pooled["predicted"].to_numpy(dtype=np.float64)
-        ok = np.isfinite(observed) & np.isfinite(predicted)
-        position_rows = int(ok.sum())
-        position_r = _pearson(observed, predicted)
-        position_rho = _rank_r(observed[ok], predicted[ok])
+
+        def against(frame: pd.DataFrame) -> tuple[int, float, float]:
+            """Rows, r and rho of the position-only fit over one set of players."""
+            if frame.empty:
+                return (0, float("nan"), float("nan"))
+            keys = frame.set_index(["team", "player_id"]).index
+            block = pooled.loc[pooled.index.intersection(keys)]
+            observed = block["observed"].to_numpy(dtype=np.float64)
+            predicted = block["predicted"].to_numpy(dtype=np.float64)
+            ok = np.isfinite(observed) & np.isfinite(predicted)
+            return (
+                int(ok.sum()),
+                _pearson(observed, predicted),
+                _rank_r(observed[ok], predicted[ok]),
+            )
+
+        position_rows, position_r, position_rho = against(shown)
+        # The same fit over only the rows whose Recovery cell prints a number.
+        # Page 6 quotes both, because the wider figure is the better estimate
+        # of the metric and the narrower one is the only one a reader can check
+        # against the column in front of them.
+        position_rows_printed, position_r_printed, _ = against(good)
 
     phase_p: dict[str, float] = {}
     phase_residual_p: dict[str, float] = {}
     residual_p = float("nan")
+    # Equal to the printing threshold on purpose: at the test's own default of
+    # five losses the Build up heading printed a p-value over fourteen players
+    # in a column that showed none of them. A p in a column heading now
+    # describes the cells under it and nothing else.
+    min_count = int(players.attrs.get("min_losses_for_player", baseline.MIN_LOSSES_FOR_PLAYER))
     if len(joined):
         if "recovery_residual" in joined.columns:
             residual_p = _permutation_p(
-                joined["recovery_residual"], joined["key"], joined["team"]
+                joined["recovery_residual"], joined["key"], joined["team"], min_count=min_count
             )
         for phase in PHASES:
             block = joined[joined["phase"] == phase]
-            phase_p[phase] = _permutation_p(block["recovery"], block["key"], block["team"])
+            phase_p[phase] = _permutation_p(
+                block["recovery"], block["key"], block["team"], min_count=min_count
+            )
             if "recovery_residual" in block.columns:
                 phase_residual_p[phase] = _permutation_p(
-                    block["recovery_residual"], block["key"], block["team"]
+                    block["recovery_residual"],
+                    block["key"],
+                    block["team"],
+                    min_count=min_count,
                 )
 
     teams = per_team(losses).set_index("team") if len(losses) else pd.DataFrame()
@@ -1167,9 +1587,12 @@ def measure_disclosure(
         position_r=position_r,
         position_rho=position_rho,
         position_rows=position_rows,
+        position_r_printed=position_r_printed,
+        position_rows_printed=position_rows_printed,
+        permutation_min_count=min_count,
         printed_rows=int(len(shown)),
         suppressed_rows=int(np.sum(~flags)),
-        min_losses=int(players.attrs.get("min_losses_for_player", baseline.MIN_LOSSES_FOR_PLAYER)),
+        min_losses=min_count,
         level_interval=level_interval,
         level_span=level_span,
         residual_interval=residual_interval,
@@ -1180,6 +1603,8 @@ def measure_disclosure(
         phase_p=phase_p,
         phase_residual_p=phase_residual_p,
         phase_printed=phase_printed,
+        cover_gaps=measure_cover_gaps(losses, team),
+        phase_gaps=measure_phase_gaps(losses, team),
         raw_difference=raw_difference,
         standardised_difference=standardised_difference,
         standardised=standardised,
@@ -1726,14 +2151,45 @@ _POLARITY_LABEL: Final[dict[str, str]] = {
 #:
 #: The colour is the redundant cue and the "Better is" column is the load-bearing
 #: one, because a red number is black in a photocopy while the word "lower" is
-#: still the word "lower". The last clause is there because a coloured delta
-#: reads as a verdict, and none of these gaps has been tested against noise.
+#: still the word "lower".
+#:
+#: This used to end "no gap in this column has been tested against chance",
+#: which was true and was the wrong fix: the machinery to test them was one
+#: module away. Every gap now carries its own p-value and the sentence has been
+#: replaced by the rule for reading it.
 POLARITY_LEGEND: Final[str] = (
-    "\"Better is\" states which direction of each row is the good one — a property of "
-    "the metric, not of this match — and a Difference printed in red is the subject team "
-    "on the wrong side of it. Both are directions, not verdicts: no gap in this column "
-    "has been tested against chance."
+    "\"vs chance\" reshuffles which team lost each ball {shuffles:,} times and counts how "
+    "often the gap comes out this big anyway. Grey means this match cannot tell the "
+    "Difference from chance: do not report it. Only a black Difference survived its own "
+    "test, and \"Better is\" then says which way is good."
 )
+
+#: What the "vs chance" cell says when the row carries no test at all.
+GAP_UNTESTED: Final[str] = "not tested"
+
+#: Why the two untestable rows are untestable, printed once under the table.
+GAP_UNTESTED_GLOSS: Final[str] = (
+    "The count rows say not tested — the shuffle holds each squad's loss count fixed, so "
+    "there is nothing in them to shuffle."
+)
+
+
+def _gap_cell(gap: TeamGap | None) -> str:
+    """What the "vs chance" column prints for one row.
+
+    Args:
+        gap: The measured gap, or None when the row carries no test.
+
+    Returns:
+        ``"p = 0.006"``, or :data:`GAP_UNTESTED`. Three decimals below 0.01,
+        because the difference between 0.006 and 0.01 is the difference
+        between clearing a correction across three phases and not, and two
+        decimals would round the one real finding in this document into
+        looking like a marginal one.
+    """
+    if gap is None or not gap.tested:
+        return GAP_UNTESTED
+    return f"p = {gap.p_value:.3f}" if gap.p_value < 0.01 else f"p = {gap.p_value:.2f}"
 
 
 def _kpi_table(
@@ -1758,19 +2214,30 @@ def _kpi_table(
     table that stacks them without saying so is inviting the inference. So a
     measured note is spanned across the table directly beneath them.
 
+    **Every gap carries its own test.** The last column is the two-sided
+    permutation p-value from :func:`permutation_team_gap` for the difference
+    beside it, over the same losses that difference was averaged from. A gap
+    the match cannot distinguish from chance is set in grey and loses its
+    polarity colour, because a red delta reads as a verdict and a verdict is
+    exactly what a p of 0.32 does not license. A row the design cannot test --
+    a count, or a cell that prints no difference at all -- says
+    :data:`GAP_UNTESTED` rather than borrowing its neighbour's p-value.
+
     Args:
         losses: Scored losses.
         team: The subject team.
         labels: Optional real team names.
         styles: Paragraph styles.
         fonts: ``(regular, bold, italic)``.
-        disclosure: Measured weaknesses, for the note under the regain row.
-            Omitted, the note is not printed rather than guessed at.
+        disclosure: Measured weaknesses, for the note under the regain row and
+            for the p-value on every row. Omitted, the note is not printed
+            rather than guessed at and every row reads :data:`GAP_UNTESTED`.
 
     Returns:
         The table.
     """
     regular, bold, _ = fonts
+    gaps = disclosure.cover_gaps if disclosure is not None else {}
     teams = per_team(losses).set_index("team")
     sides = plots.ordered_teams(list(teams.index) + [team])
     other = [side for side in sides if side != team]
@@ -1795,14 +2262,14 @@ def _kpi_table(
     own_us, opp_us = half_counts(team)
     own_them, opp_them = half_counts(opponent)
 
-    rows: list[tuple[str, str, str, str, str, float]] = []
+    rows: list[tuple[str, str, str, str, str, float, TeamGap | None]] = []
 
     def add(
         label: str,
+        key: str,
         us: float,
         them: float,
         fmt: Any,
-        polarity: str,
         *,
         delta_fmt: Any | None = None,
     ) -> None:
@@ -1812,22 +2279,22 @@ def _kpi_table(
         if np.isfinite(us) and np.isfinite(them):
             difference = us - them
             gap = (delta_fmt or (lambda v: _signed(v, 2)))(difference)
-        rows.append((label, fmt(us), fmt(them), gap, polarity, difference))
+        rows.append((label, fmt(us), fmt(them), gap, _POLARITY[key], difference, gaps.get(key)))
 
     add(
         f"Counter-press recovery, 5 s ({weighting})",
+        "recovery",
         stat(team, "mean_recovery"),
         stat(opponent, "mean_recovery"),
         lambda v: _num(v, 3),
-        _POLARITY["recovery"],
         delta_fmt=lambda v: _signed(v, 3),
     )
     add(
         "Regain within 5 s (event stream)",
+        "regain",
         stat(team, "regain_rate"),
         stat(opponent, "regain_rate"),
         _pct,
-        _POLARITY["regain"],
         # Percentages differ in percentage POINTS, and saying so is the
         # difference between "eight tenths of a point" and "eight tenths of a
         # percent", which are not the same number.
@@ -1837,10 +2304,10 @@ def _kpi_table(
     regain_row = len(rows)
     add(
         "Possession losses",
+        "losses",
         stat(team, "losses"),
         stat(opponent, "losses"),
         lambda v: _int(v),
-        _POLARITY["losses"],
         delta_fmt=lambda v: _signed(v, 0),
     )
     rows.append(
@@ -1851,21 +2318,22 @@ def _kpi_table(
             "—",
             _POLARITY["halves"],
             float("nan"),
+            None,
         )
     )
     add(
         f"EPV conceded per loss ({plots.EPV_DISPLAY_UNIT})",
+        "epv",
         stat(team, "mean_epv_conceded") * plots.EPV_DISPLAY_SCALE,
         stat(opponent, "mean_epv_conceded") * plots.EPV_DISPLAY_SCALE,
         lambda v: _signed(v, 2),
-        _POLARITY["epv"],
     )
     add(
         "Median time to regain (s)",
+        "time_to_regain",
         stat(team, "median_time_to_regain"),
         stat(opponent, "median_time_to_regain"),
         lambda v: _num(v, 2),
-        _POLARITY["time_to_regain"],
     )
 
     header = (
@@ -1874,14 +2342,16 @@ def _kpi_table(
         plots.team_label(opponent, labels) if opponent else "—",
         "Difference",
         "Better is",
+        "vs chance",
     )
     data: list[list[Any]] = [
-        [_p(header[0], styles.caption), header[1], header[2], header[3], header[4]]
+        [_p(header[0], styles.caption), *header[1:]]
     ]
     commands: list[tuple[Any, ...]] = []
     note = _regain_note(disclosure, styles)
     for row in rows:
         index = len(data)
+        gap = row[6]
         data.append(
             [
                 _p(row[0], styles.body),
@@ -1889,17 +2359,31 @@ def _kpi_table(
                 row[2],
                 row[3],
                 _POLARITY_LABEL.get(row[4], "—"),
+                _gap_cell(gap),
             ]
         )
-        # A delta on the wrong side of a metric whose polarity we have just
-        # declared is the one cell on this table a coach must not misread.
-        if row[4] != "neither" and np.isfinite(row[5]) and row[5] != 0.0:
-            worse = (row[5] < 0.0) if row[4] == "higher" else (row[5] > 0.0)
-            if worse:
-                commands.append(("TEXTCOLOR", (3, index), (3, index), _ALERT))
+        if gap is not None and gap.separates:
+            # The one styling this table applies to a finding rather than to a
+            # direction. Bold and black, and only ever after the test.
+            commands += [
+                ("FONT", (3, index), (3, index), bold, 8.2),
+                ("FONT", (5, index), (5, index), bold, 7.4),
+                ("TEXTCOLOR", (5, index), (5, index), _INK),
+            ]
+            # A delta on the wrong side of a metric whose polarity we have just
+            # declared is the one cell on this table a coach must not misread
+            # -- but only once the gap has been shown to be a gap at all.
+            if row[4] != "neither" and np.isfinite(row[5]) and row[5] != 0.0:
+                worse = (row[5] < 0.0) if row[4] == "higher" else (row[5] > 0.0)
+                if worse:
+                    commands.append(("TEXTCOLOR", (3, index), (3, index), _ALERT))
+        else:
+            # Grey, and no polarity colour. Everything this match cannot
+            # separate from chance looks the same and looks like nothing.
+            commands.append(("TEXTCOLOR", (3, index), (3, index), _INK_MUTED))
         if note is not None and index == regain_row:
             span = len(data)
-            data.append([note, "", "", "", ""])
+            data.append([note, "", "", "", "", ""])
             commands += [
                 ("SPAN", (0, span), (-1, span)),
                 ("BACKGROUND", (0, span), (-1, span), _ALERT_TINT),
@@ -1908,17 +2392,19 @@ def _kpi_table(
                 ("BOTTOMPADDING", (0, span), (-1, span), 4.0),
             ]
 
-    widths = [FRAME_W * w for w in (0.415, 0.165, 0.165, 0.150, 0.105)]
+    widths = [FRAME_W * w for w in (0.340, 0.145, 0.145, 0.140, 0.095, 0.135)]
     table = Table(data, colWidths=widths, hAlign="LEFT")
-    commands += [
+    # Base first, per-row second: reportlab lets a later command win, and the
+    # per-row commands are precisely the exceptions to the base.
+    base: list[tuple[Any, ...]] = [
         ("ALIGN", (1, 0), (3, -1), "RIGHT"),
-        ("ALIGN", (4, 0), (4, -1), "CENTER"),
+        ("ALIGN", (4, 0), (-1, -1), "CENTER"),
         ("FONT", (1, 1), (1, -1), bold, 10.5),
         ("TEXTCOLOR", (1, 1), (1, -1), _team_ink(team)),
         ("FONT", (2, 1), (2, -1), regular, 9.5),
         ("TEXTCOLOR", (2, 1), (2, -1), _team_ink(opponent)),
-        ("FONT", (4, 1), (4, -1), regular, 7.4),
-        ("TEXTCOLOR", (4, 1), (4, -1), _INK_MUTED),
+        ("FONT", (4, 1), (-1, -1), regular, 7.4),
+        ("TEXTCOLOR", (4, 1), (-1, -1), _INK_MUTED),
         ("TEXTCOLOR", (1, 0), (1, 0), _team_ink(team)),
         ("TEXTCOLOR", (2, 0), (2, 0), _team_ink(opponent)),
         ("LINEBELOW", (0, 0), (-1, 0), 0.8, _INK),
@@ -1926,7 +2412,7 @@ def _kpi_table(
         ("TOPPADDING", (0, 0), (-1, -1), 4.0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4.0),
     ]
-    table.setStyle(_table_style(commands, regular, bold))
+    table.setStyle(_table_style([*base, *commands], regular, bold))
     return table
 
 
@@ -1944,33 +2430,67 @@ def _regain_note(disclosure: Disclosure | None, styles: _Styles) -> Paragraph | 
     if disclosure is None or not np.isfinite(disclosure.regain_r):
         return None
     return _p(
-        "These two rows are almost unrelated. Over the "
-        f"{disclosure.n_scored} scored losses of this match they correlate at "
-        f"r = {_signed(disclosure.regain_r, 2)}: a high recovery share is not a claim "
-        "that the ball came back, and the two rows must not be read as one "
-        "finding stated twice. Recovery is control of the ground; regain is "
-        "possession of the ball.",
+        "Almost unrelated: over the "
+        f"{disclosure.n_scored} scored losses of this match, r = "
+        f"{_signed(disclosure.regain_r, 2)}. Recovery is control of ground; "
+        "regain is possession of the ball.",
         styles.alert,
     )
+
+
+def _phase_gap_cell(gap: TeamGap | None) -> str:
+    """The two-line gap-and-p cell spanning one phase's pair of rows.
+
+    Args:
+        gap: The measured gap for that phase, or None.
+
+    Returns:
+        ``"+0.055\\np = 0.006"``, or :data:`GAP_UNTESTED`.
+    """
+    if gap is None or not np.isfinite(gap.difference):
+        return GAP_UNTESTED
+    return f"{_signed(gap.difference, 3)}\n{_gap_cell(gap)}"
 
 
 def _phase_table(
     losses: pd.DataFrame,
     labels: dict[str, str] | None,
     fonts: tuple[str, str, str],
+    disclosure: Disclosure | None = None,
 ) -> Table:
     """The page-2 breakdown by pitch phase, for both teams.
+
+    The last column is the one this table was missing. Every other page tells
+    the reader to compare the two squads inside a row and never across rows;
+    this prints that comparison, with the p-value from
+    :func:`permutation_team_gap` under it, so the phases stop looking equally
+    real. On the bundled match one of the three clears its own null and the
+    other two do not, and until this column existed all three were set in the
+    same face at the same weight.
+
+    The gap cell is spanned across a phase's two team rows because it is one
+    fact about the pair, not two facts about two squads.
 
     Args:
         losses: Scored losses.
         labels: Optional real team names.
         fonts: ``(regular, bold, italic)``.
+        disclosure: Measured weaknesses, for the per-phase gaps. Omitted, the
+            column prints :data:`GAP_UNTESTED` rather than a guess.
 
     Returns:
         The table.
     """
     regular, bold, _ = fonts
     phases = per_phase(losses)
+    gaps = disclosure.phase_gaps if disclosure is not None else {}
+    subject = next((gap.subject for gap in gaps.values()), "")
+    opponent = next((gap.opponent for gap in gaps.values()), "")
+    gap_header = (
+        f"{plots.team_label(subject, labels)} − {plots.team_label(opponent, labels)}\nrecovery"
+        if subject and opponent
+        else "Recovery gap"
+    )
     header = [
         "Phase",
         "Team",
@@ -1979,14 +2499,19 @@ def _phase_table(
         "Mean recovery\n5 s",
         f"EPV swing\n({plots.EPV_DISPLAY_UNIT})",
         "Regain\nwithin 5 s",
+        gap_header,
     ]
     data: list[list[Any]] = [header]
     ink: list[tuple[Any, ...]] = []
+    highlight: list[tuple[Any, ...]] = []
     sides = plots.ordered_teams(phases["team"]) if not phases.empty else []
     for phase in PHASES:
+        first_row = len(data)
+        gap = gaps.get(phase)
         for side in sides:
             block = phases[(phases["phase"] == phase) & (phases["team"] == side)]
             row_index = len(data)
+            gap_cell = _phase_gap_cell(gap) if row_index == first_row else ""
             if block.empty:
                 data.append(
                     [
@@ -1997,6 +2522,7 @@ def _phase_table(
                         "—",
                         "—",
                         "—",
+                        gap_cell,
                     ]
                 )
                 ink.append(("TEXTCOLOR", (1, row_index), (1, row_index), _team_ink(side)))
@@ -2012,28 +2538,52 @@ def _phase_table(
                     _num(entry["mean_recovery"], 3),
                     _signed(_scaled_epv(entry["mean_epv_conceded"]), 2),
                     _pct(entry["regain_rate"], 1),
+                    gap_cell,
                 ]
             )
             ink.append(("TEXTCOLOR", (1, row_index), (1, row_index), _team_ink(side)))
             if thin:
                 ink.append(("TEXTCOLOR", (2, row_index), (-1, row_index), _INK_MUTED))
+        last_row = len(data) - 1
+        if last_row < first_row:
+            continue
+        if last_row > first_row:
+            ink.append(("SPAN", (-1, first_row), (-1, last_row)))
+        if gap is not None and gap.separates:
+            # The only styling on this table that says "this one is different",
+            # and it is applied strictly on the test, never on the size of the
+            # number. The recovery pair is bolded with it because the gap cell
+            # is a statement about exactly those two cells.
+            highlight += [
+                ("FONT", (-1, first_row), (-1, last_row), bold, 7.4),
+                ("TEXTCOLOR", (-1, first_row), (-1, last_row), _ALERT),
+                ("FONT", (4, first_row), (4, last_row), bold, 8.2),
+                ("TEXTCOLOR", (4, first_row), (4, last_row), _INK),
+                ("LINEBEFORE", (-1, first_row), (-1, last_row), 2.0, _ALERT),
+            ]
+        else:
+            highlight.append(("TEXTCOLOR", (-1, first_row), (-1, last_row), _INK_MUTED))
     if len(data) == 1:
-        data.append(["—", "—", "0", "0", "—", "—", "—"])
+        data.append(["—", "—", "0", "0", "—", "—", "—", GAP_UNTESTED])
 
-    widths = [FRAME_W * w for w in (0.17, 0.15, 0.11, 0.13, 0.17, 0.15, 0.12)]
+    widths = [FRAME_W * w for w in (0.135, 0.115, 0.085, 0.115, 0.145, 0.125, 0.105, 0.175)]
     table = Table(data, colWidths=widths, hAlign="LEFT", repeatRows=1)
     commands: list[tuple[Any, ...]] = [
         ("BACKGROUND", (0, 0), (-1, 0), _HEADER_FILL),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONT", (0, 0), (-1, 0), bold, 7.4),
         ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
-        ("LINEBELOW", (0, 1), (-1, -2), 0.25, _RULE),
+        ("FONT", (-1, 1), (-1, -1), regular, 7.4),
+        ("VALIGN", (-1, 1), (-1, -1), "MIDDLE"),
+        # Stops one row short of the gap column: a hairline drawn through a
+        # cell spanning two rows cuts the pair the cell is a statement about.
+        ("LINEBELOW", (0, 1), (-2, -2), 0.25, _RULE),
         *ink,
     ]
     for index in range(1, len(data)):
         if index % 2 == 0:
             commands.append(("BACKGROUND", (0, index), (-1, index), _ZEBRA))
-    table.setStyle(_table_style(commands, regular, bold))
+    table.setStyle(_table_style([*commands, *highlight], regular, bold))
     return table
 
 
@@ -2272,44 +2822,68 @@ def _player_table(
 # --------------------------------------------------------------------------- #
 
 
-def _cover_evidence(
+#: The cover's one boxed warning, given the same treatment page 6 got.
+#:
+#: An instruction rather than a hedge, for the reason
+#: :data:`RANK_WARNING_HEADING` documents.
+COVER_WARNING_HEADING: Final[str] = (
+    "Read this before you read the table: this metric measures ground, not effort"
+)
+
+
+def _cover_warning(
     disclosure: Disclosure | None,
     labels: dict[str, str] | None,
     styles: _Styles,
 ) -> list[Flowable]:
-    """The two checks the cover asserts and never used to show.
+    """The single boxed panel that carries everything page 1 must qualify.
 
-    The first attaches a number to the field-position caveat directly above it,
-    which the repository stated qualitatively for a long time and quantified
-    nowhere. The second is the arithmetic the caveat itself demands: the cover
-    prints one pooled cross-phase recovery per team and subtracts them, two
-    lines above a sentence saying cross-phase recoveries must not be
-    subtracted. The pooled difference is only readable if it survives putting
-    both squads on a common phase mix, so the check is run and printed.
+    This replaces four separate caveats in four typographic registers -- a
+    tinted panel, an italic grey indent, a body-face aside and a small grey
+    footnote -- none of which told the reader which mattered most. An audit
+    counted about 400 of the cover's 568 words as caveat and judged that page 1
+    had crossed the line where hedges stop being read, while page 6, which
+    carries more words of warning, had not: page 6 has one box, one heading,
+    one face, and every claim in it carries a number from this match. This is
+    that treatment, applied to the cover.
+
+    The order is the hierarchy, and the first sentence is the one thing a
+    reader who reads nothing else has to take away.
+
+    Every number is measured on the match in hand. A sentence whose number
+    could not be measured is dropped rather than softened into a hedge, so a
+    match where the position check cannot be fitted prints a shorter box rather
+    than a vaguer one.
 
     Args:
-        disclosure: Measured weaknesses, or None for no evidence lines.
+        disclosure: Measured weaknesses, or None for no panel at all.
         labels: Optional real team names.
         styles: Paragraph styles.
 
     Returns:
-        Zero, one or two paragraphs.
+        Zero or one boxed panel.
     """
     if disclosure is None:
         return []
-    out: list[Flowable] = []
-    if disclosure.has_position_check:
-        out.append(
-            _p(
-                "Measured on this match, not asserted: a model that knows only where "
-                "each player's turnovers happened reproduces the whole per-player "
-                f"recovery column on page 6 at r = {_signed(disclosure.position_r, 2)} "
-                f"over {disclosure.position_rows} players. That column ranks territory. "
-                "Page 6 says so at the top, in full.",
-                styles.alert,
-            )
-        )
+    # The phase rule is unconditional: it is the one thing a reader who reads
+    # nothing else has to take away, and it is true of a match too thin to fit
+    # the position model as much as of the bundled one. The position evidence
+    # is prefixed to it when this match can supply the number, and left out
+    # when it cannot rather than softened into an assertion.
+    opening = (
+        "Recovery is the share of the pitch a team held for five seconds after losing "
+        "the ball, so it measures ground, and ground is mostly geography. Measured on "
+        "this match, not asserted: a model given nothing but WHERE each player's "
+        "turnovers happened reproduces page 6's whole per-player recovery column at "
+        f"r = {_signed(disclosure.position_r, 2)} over {disclosure.position_rows} "
+        f"players — {disclosure.position_r ** 2 * 100.0:.0f}% of what separates one "
+        "player from another in it. Rank nobody on it. "
+        if disclosure.has_position_check
+        else ""
+    )
+    lines: list[str] = [opening + PHASE_CAVEAT]
 
+    standardised_gap = disclosure.cover_gaps.get("recovery_standardised")
     if np.isfinite(disclosure.standardised_difference) and np.isfinite(disclosure.raw_difference):
         halves = "; ".join(
             f"{plots.team_label(side, labels)} {own}/{opp}"
@@ -2319,24 +2893,46 @@ def _cover_evidence(
             f"{plots.team_label(side, labels)} {value:.3f}"
             for side, value in sorted(disclosure.standardised.items())
         )
-        verdict = (
-            "the sign survives, so the recovery row may be read as a difference"
-            if disclosure.standardisation_holds
-            else "the sign does NOT survive, so the recovery row must not be read as a "
-            "difference"
+        # The recovery row pools three phases the sentence above has just
+        # forbidden pooling, so the check is run and printed rather than
+        # asserted -- and it gets its own p-value, from the phase-stratified
+        # design, because it is the phase-conditional number.
+        check = (
+            "That is also why the recovery row is not a plain difference: the squads did "
+            f"not lose the ball in the same places (own half/opponent half: {halves}). On "
+            f"the match's own phase mix it reads {standardised} — a gap of "
+            f"{_signed(disclosure.standardised_difference, 3)} against the "
+            f"{_signed(disclosure.raw_difference, 3)} in the table."
         )
-        out.append(
-            _p(
-                "The recovery row pools three phases and the squads did not lose the ball "
-                f"in the same places (own half/opponent half: {halves}). Putting both on "
-                f"the match's own phase mix gives {standardised}, a gap of "
-                f"{_signed(disclosure.standardised_difference, 3)} where the row above "
-                f"prints {_signed(disclosure.raw_difference, 3)} — {verdict}. A "
-                "difference of two pooled numbers is not otherwise safe to read.",
-                styles.caveat,
+        raw_gap = disclosure.cover_gaps.get("recovery")
+        if standardised_gap is not None and standardised_gap.tested:
+            # Two designs, two numbers, each printed beside the figure it
+            # belongs to rather than one of them chosen after the fact. See
+            # ``permutation_team_gap`` for why the pooled row gets the
+            # unstratified null and this line gets the stratified one.
+            against = (
+                f", against p = {raw_gap.p_value:.2f} for the pooled figure"
+                if raw_gap is not None and raw_gap.tested
+                else ""
             )
+            check += (
+                " The phase-conditional gap is the one this caveat permits testing: "
+                f"p = {standardised_gap.p_value:.3f} over "
+                f"{standardised_gap.n_shuffles:,} shuffles{against}. Page 2 shows which "
+                "phase it comes from."
+            )
+        lines.append(check)
+
+    if not lines:
+        return []
+    return [
+        _callout(
+            [
+                _p(COVER_WARNING_HEADING, styles.alert_heading),
+                *[_p(line, styles.alert) for line in lines],
+            ]
         )
-    return out
+    ]
 
 
 def cover_page(
@@ -2350,7 +2946,21 @@ def cover_page(
     title: str = "Counter-press report",
     disclosure: Disclosure | None = None,
 ) -> list[Flowable]:
-    """Page 1: the fixture, the headline numbers and the caveats that frame them.
+    """Page 1: the fixture, the headline numbers, and one warning that frames them.
+
+    The page is laid out in four registers and no more, in descending order of
+    what a reader must not miss: the head-to-head table, where every gap now
+    carries its own permutation p-value; one boxed warning in the body face,
+    which is the only thing on the page a reader who reads one thing should
+    read; the legend that says how to read the table's greys; and then the
+    figures and the two factual footnotes about counts.
+
+    What used to be here instead was four caveats in four registers -- a
+    tinted panel, an italic indent, a body-face aside and a grey footnote --
+    with nothing saying which mattered most, and a legend confessing that no
+    gap in the table had been tested. Testing the gaps let most of that prose
+    be deleted rather than rewritten: a p-value in a cell replaces a paragraph
+    explaining that there is no p-value.
 
     Args:
         losses: Scored losses.
@@ -2377,13 +2987,16 @@ def cover_page(
         # -width figures and a fixed-width table, and an unpinned paragraph
         # beside them reflows under ``KeepInFrame`` and comes out wider than
         # everything it is captioning.
-        _fixed_width(_p(POLARITY_LEGEND, styles.note)),
-        Spacer(1, 7),
-        _fixed_width(_p(PHASE_CAVEAT, styles.caveat)),
+        _fixed_width(
+            _p(
+                POLARITY_LEGEND.format(shuffles=COVER_SHUFFLES) + " " + GAP_UNTESTED_GLOSS,
+                styles.note,
+            )
+        ),
     ]
-    evidence = _cover_evidence(disclosure, labels, styles)
-    if evidence:
-        story += [Spacer(1, 4), *(_fixed_width(item) for item in evidence)]
+    warning = _cover_warning(disclosure, labels, styles)
+    if warning:
+        story += [Spacer(1, 7), *warning]
     story.append(Spacer(1, 6))
     # The bars sit directly under the caveat because they are the evidence for
     # it: three pairs of bars an order apart, with the sample size printed on
@@ -2419,19 +3032,19 @@ def cover_page(
                 scored_note += " None were dropped: page 2 draws them as grey crosses."
             else:
                 if missing == 1:
-                    they, carry, them = "That one is", "carries", "it"
+                    they, carry, them = "That one", "carries", "it"
                 else:
-                    they, carry, them = f"{missing} of them are", "carry", "them"
+                    they, carry, them = f"{missing} of them", "carry", "them"
                 scored_note += (
-                    f" {they} counted in the {disclosure.total_losses} above but "
-                    f"{carry} no ball position at all, so there is nowhere on a pitch "
-                    f"to draw {them}."
+                    f" {they} {carry} no ball position at all, so there is nowhere on a "
+                    f"pitch to draw {them}"
                 )
-                if disclosure.phase_table_short_by:
-                    scored_note += (
-                        " With no position there is no pitch third either, so page 2's "
-                        f"phase table works from {disclosure.phase_rows}."
-                    )
+                scored_note += (
+                    f" and no pitch third to file {them} under; page 2's phase table "
+                    f"works from {disclosure.phase_rows}."
+                    if disclosure.phase_table_short_by
+                    else "."
+                )
     ball_out = summary.get("ball_out_count")
     if ball_out is not None:
         scored_note += (
@@ -2440,14 +3053,14 @@ def cover_page(
         )
     story += [
         Spacer(1, 4),
-        _fixed_width(_p(scored_note, styles.note)),
-        Spacer(1, 6),
+        # Two footnotes of counts, not of caveat, in the one small grey register
+        # this page keeps for them. The EPV provenance note that used to end the
+        # cover is printed on page 2 under the figure it actually qualifies; a
+        # second copy here only competed with the box above for attention.
         _fixed_width(
             _p(
-                "The rest of this report: page 2, every loss on one pitch and the same "
-                "losses split by phase. Pages 3–5, the five turnovers this ranking "
-                "picks out, with the pitch-control surface behind each one. Page 6, the "
-                "same numbers per player, for both squads. " + EPV_PROVENANCE,
+                scored_note + " Page 2 maps them all; pages 3–5 are five turnovers to "
+                "find on video; page 6 is the same numbers per player.",
                 styles.note,
             )
         ),
@@ -2493,15 +3106,17 @@ def _unscored_note(disclosure: Disclosure | None) -> str:
             "quietly hides its failures flatters the press."
         )
     # Where the undrawable losses went, stated as arithmetic the reader can do
-    # on the page in front of them. The phase table below adds up to fewer than
-    # the cover's headline count whenever a loss has no position, because a loss
+    # on the page in front of them. The phase table adds up to fewer than the
+    # cover's headline count whenever a loss has no position, because a loss
     # with no position has no pitch third either, and a footnote that does not
-    # say so leaves the reader to find the discrepancy themselves.
+    # say so leaves the reader to find the discrepancy themselves. The note is
+    # printed under that table, so it says "above" -- it said "below" until the
+    # gap column was added and the whole page was read back off the paper.
     elsewhere = ""
     if disclosure.phase_table_short_by:
         elsewhere = (
             " — and no pitch third to file it under, which is why the Losses column in "
-            f"the table below adds up to {disclosure.phase_rows} and not the "
+            f"the table above adds up to {disclosure.phase_rows} and not the "
             f"{disclosure.total_losses} the cover counts"
         )
     if drawn == 0:
@@ -2525,6 +3140,70 @@ def _unscored_note(disclosure: Disclosure | None) -> str:
         f"had no ball position at all, so there is nowhere on a pitch to draw {them}"
         f"{elsewhere}."
     )
+
+
+def _phase_verdict(
+    disclosure: Disclosure | None,
+    labels: dict[str, str] | None,
+    styles: _Styles,
+) -> list[Flowable]:
+    """One line under the phase table, naming what survived its own null.
+
+    Without it the reader has three p-values and no statement of what they add
+    up to, which is the same failure as printing three untested rows: the page
+    leaves the arithmetic to somebody who is reading it in five minutes.
+
+    The sentence is generated from the measurements, so a match where nothing
+    clears says nothing cleared, and a match where two phases clear names both.
+
+    Args:
+        disclosure: Measured weaknesses, or None for no line.
+        labels: Optional real team names.
+        styles: Paragraph styles.
+
+    Returns:
+        Zero or one paragraph, plus its spacer.
+    """
+    if disclosure is None:
+        return []
+    tested = [gap for gap in disclosure.phase_gaps.values() if gap.tested]
+    if not tested:
+        return []
+    strong = [
+        (phase, gap)
+        for phase, gap in disclosure.phase_gaps.items()
+        if gap.tested and gap.separates
+    ]
+    if not strong:
+        text = (
+            f"None of the {len(tested)} phase gaps above is bigger than reshuffling which "
+            f"team lost each ball routinely produces ({COVER_SHUFFLES:,} shuffles). On this "
+            "match the two squads press alike everywhere the metric can see, and no row of "
+            "this table should be reported as a difference."
+        )
+    else:
+        # Bonferroni across the phases actually tested, because three gaps were
+        # examined and the reader is being pointed at the smallest of them. A
+        # finding that only survives before the correction is worth less, and
+        # the page has to say which kind this is.
+        parts = []
+        for phase, gap in strong:
+            leader = gap.subject if gap.difference > 0.0 else gap.opponent
+            parts.append(
+                f"in the {phase.replace('_', ' ')}, {plots.team_label(leader, labels)} by "
+                f"{abs(gap.difference):.3f}, p = {gap.p_value:.3f} and "
+                f"{min(1.0, gap.p_value * len(tested)):.3f} after correcting for the "
+                f"{len(tested)} phases tested"
+            )
+        count = "one is" if len(strong) == 1 else f"{len(strong)} are"
+        text = (
+            f"One row here is not like the others. Of the {len(tested)} gaps above, "
+            f"{count} bigger than "
+            "reshuffling which team lost each ball produces: " + "; ".join(parts) + ". "
+            "The other rows are not, and neither is the pooled recovery difference on the "
+            "cover. This is the comparison on this report with a test behind it."
+        )
+    return [_fixed_width(_p(text, styles.alert)), Spacer(1, 5)]
 
 
 def loss_map_page(
@@ -2559,8 +3238,9 @@ def loss_map_page(
         _fig_image(figure, FRAME_W),
         Spacer(1, 6),
         _p("Broken down by pitch phase", styles.heading),
-        _phase_table(losses, labels, fonts),
+        _phase_table(losses, labels, fonts, disclosure),
         Spacer(1, 5),
+        *_phase_verdict(disclosure, labels, styles),
         _p(
             "Phases are measured from the losing team's own goal: build-up is that "
             "team's own third, final third is the opponent's. Compare the two teams "
@@ -2923,15 +3603,45 @@ def _rank_warning(disclosure: Disclosure | None, styles: _Styles) -> Table | Non
             if np.isfinite(disclosure.position_rho)
             else ""
         )
+        # Both populations, named. The wider figure is the better estimate of
+        # the metric; the narrower one is the only one a reader can check
+        # against the column in front of them, and printing the wider figure
+        # alone over a column showing fewer rows is the kind of thing a
+        # sceptical reader finds and then stops trusting the rest.
+        narrower = ""
+        if (
+            np.isfinite(disclosure.position_r_printed)
+            and disclosure.position_rows_printed
+            and disclosure.position_rows_printed != disclosure.position_rows
+        ):
+            narrower = (
+                f" That is every player credited with a turnover; over the "
+                f"{disclosure.position_rows_printed} of them whose Recovery cell below "
+                f"actually prints a number it is r = "
+                f"{_signed(disclosure.position_r_printed, 2)}."
+            )
         lines.append(
             "Measured on this match, not asserted: a model given nothing but WHERE "
             "each player's turnovers happened — no pressing, no shape, no identity — "
             f"reproduces the Recovery 5 s column at r = {_signed(disclosure.position_r, 2)} "
             f"over {disclosure.position_rows} players{rho}. Squared, that is "
             f"{disclosure.position_r ** 2 * 100.0:.0f}% of everything separating one "
-            "player from another in it. Recovery is the share of the pitch a team held "
-            "after a turnover, and control of ground is mostly geography. Sort this "
-            "column and you have very largely sorted the squad by where it plays."
+            f"player from another in it.{narrower} Recovery is the share of the pitch a "
+            "team held after a turnover, and control of ground is mostly geography. Sort "
+            "this column and you have very largely sorted the squad by where it plays."
+        )
+
+    # The column is headed "Recovery", so a page circulated on its own has to
+    # say, on the page, that a high one is not a claim that the ball came back.
+    # This sentence lived only on the cover until an audit pointed out that
+    # page 6 is the page that leaves the building.
+    if np.isfinite(disclosure.regain_r):
+        lines.append(
+            "It is also not a regain. Over the "
+            f"{disclosure.n_scored} scored losses of this match, Recovery and whether the "
+            "ball was actually won back inside the five seconds correlate at "
+            f"r = {_signed(disclosure.regain_r, 2)}: a high number here says the team held "
+            "the ground, not that the ball came back."
         )
 
     residual = (
@@ -3018,9 +3728,13 @@ def _rank_warning(disclosure: Disclosure | None, styles: _Styles) -> Table | Non
             for phase in PHASES
             if phase in measured
         )
+        # Each p is computed over exactly the players whose cell prints, which
+        # is why a column with no printable cell carries no p rather than a
+        # p-value for a population the table refuses to show.
         phase_line += (
             f" Of the {disclosure.printed_rows} rows here, the number carrying a printed "
-            f"value is {counts}."
+            f"value is {counts} — and each p above was computed over those players and no "
+            f"others, so a column with nothing in it carries no p either."
         )
         lines.append(phase_line + empty_note)
         empty_note = ""
