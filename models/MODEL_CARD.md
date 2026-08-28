@@ -2,17 +2,23 @@
 
 Event-only proxy for the tracking-derived counter-press metric.
 
-- **Artefacts**: `models/proxy_gbr.pkl.gz`, 132,367 bytes, refitted on every labelled row — the
-  deployable model; and `models/proxy_gbr_split.pkl.gz`, 124,377 bytes, fitted on the training
+- **Artefacts**: `models/proxy_gbr.pkl.gz`, 132,321 bytes, refitted on every labelled row — the
+  deployable model; and `models/proxy_gbr_split.pkl.gz`, 124,333 bytes, fitted on the training
   matches only — the model the metrics below describe. Both are gzipped pickles of a
   `pressing.proxy.ProxyModel`. See §5.2 for which to use when, and §6.1 for what is inside them.
 - **Estimator**: `sklearn.ensemble.HistGradientBoostingRegressor`, squared error, learning rate
   0.05, 31 leaves, `min_samples_leaf=40`, `l2_regularization=1.0`, early stopping on a 15%
   internal validation slice. Stopped at **83** boosting iterations (refit) and **79** (split).
-- **scikit-learn**: 1.9.0. **Trained**: 2026-08-26.
+- **scikit-learn**: 1.9.0.
+- **Identity**: SHA-256 `94f6af0f22ffa5b52b208efb8756969b0a3b33a3dead91b87eed2bcb12d0a3ed` (refit)
+  and `1364b8d9a831313b28c9f1c43ce61085f33ad7da0d88bdd47eedd82bdab5d22e` (split). Neither file
+  records when it was built — a training timestamp is a byte that changes every run and nothing
+  read it. `git log models/` answers "when"; the digests above answer "which". §5.1 has the proof
+  that a rebuild lands on them.
 - **Reproduce**: `uv run python -m pressing.proxy --download --jobs 5`, which writes both
   artefacts (about 200 requests at one per second, then 1.2 GB of cache to label). The result no
-  longer depends on `--jobs`; §5.1 says why that sentence had to be earned.
+  longer depends on `--jobs`, and no longer depends on the clock; §5.1 says why both of those
+  sentences had to be earned.
 
 ---
 
@@ -230,7 +236,9 @@ stopping iteration and a different fitted tree.
 
 **Demonstration.** Three fresh processes refitting the split model on the canonical frame of the
 6,195 labelled rows produced byte-identical held-out prediction vectors — SHA-256
-`c12d212d7d7aade9…` three times — full-model r = 0.369162 and x-only r = 0.197444 to six decimals
+`c12d212d7d7aade99b7b93e8478bdc45d4581747f00fc0f31b51c9f4e30d7ccd`, which is
+`sha256(split.predict(held_out).astype("float64").tobytes())` and which the shipped artefact still
+reproduces — full-model r = 0.369162 and x-only r = 0.197444 to six decimals
 each time, stopping at iteration 79. Shuffling nothing but the row order of that same frame, at
 three seeds, gave full-model r = 0.369387, 0.374414 and 0.368491 (stopping at 85, 69 and 85) and
 x-only r = 0.203469, 0.210770 and 0.202058. The `mean` and `phase` baselines, which fit no booster,
@@ -247,8 +255,59 @@ settled than it was.
 canonical row order — ascending `match_id`, and within a match the order the per-match builder
 produced. Verified on the first 16 training matches (1,124 turnovers): `--jobs 1`, `--jobs 4`,
 `--jobs 7` and `--jobs 4` with the match ids handed over in reverse all produce a frame with the
-identical SHA-256, `0a5cc7ec2f6539f9253f671e3f2a5bd5`. `tests/test_proxy.py` pins the ordering
-property so it cannot regress.
+identical digest `5bf21169f50119fd3a4f1d8d16833dcb80e0cd4b586747c2043adf2ca5cf8876`, where a
+frame's digest means
+`hashlib.sha256(pd.util.hash_pandas_object(frame, index=False).to_numpy().tobytes()).hexdigest()`.
+`tests/test_proxy.py` pins the ordering property so it cannot regress.
+
+> Up to v0.1.1 this paragraph gave `0a5cc7ec2f6539f9253f671e3f2a5bd5` and called it a SHA-256. It
+> is 32 hex characters, which no SHA-256 is, it named no hashing recipe, and no recipe tried here
+> reproduces it. It has been replaced by the digest above and by the command that produces it.
+
+### 5.1.1 The artefacts are byte-reproducible
+
+A deterministic fit is not a reproducible file. Up to v0.1.1 two training runs that fitted
+identical trees still wrote different bytes, for two reasons that both came down to reading a
+clock:
+
+- **The gzip header.** `gzip.open` writes `time.time()` into header bytes 4:8. The v0.1.1 split
+  artefact carried `1f8b 0808 2e41 8f6a` — mtime `0x6a8f412e`, 1787773230 — and every rewrite
+  moved those four bytes. Demonstrated by saving one unchanged model twice, 1.2 s apart, through
+  the old code path: the two files differed at byte offset 4 and nowhere else.
+- **`trained_utc`.** `train_from_cache` stamped `pd.Timestamp.now(tz="UTC").isoformat()` into the
+  metadata, so a fresh string went *inside* the pickle on every run. Because it is compressed, its
+  length changed too: the same model saved with three different timestamps came out at 124,366,
+  124,366 and 124,356 bytes. That is the size wobble the v0.1.1 audit observed.
+
+`save_model` now writes `gzip.GzipFile(..., mtime=proxy.ARTEFACT_GZIP_MTIME)`, which is 0 — the
+value the format reserves for "no timestamp" — and no metadata field reads a clock.
+
+**Proof.** Two fresh Python processes, each running `train_from_cache` end to end over the whole
+1.2 GB cache and writing into its own directory:
+
+```
+sha256  1364b8d9a831313b28c9f1c43ce61085f33ad7da0d88bdd47eedd82bdab5d22e  runA/proxy_gbr_split.pkl.gz
+sha256  94f6af0f22ffa5b52b208efb8756969b0a3b33a3dead91b87eed2bcb12d0a3ed  runA/proxy_gbr.pkl.gz
+sha256  1364b8d9a831313b28c9f1c43ce61085f33ad7da0d88bdd47eedd82bdab5d22e  runB/proxy_gbr_split.pkl.gz
+sha256  94f6af0f22ffa5b52b208efb8756969b0a3b33a3dead91b87eed2bcb12d0a3ed  runB/proxy_gbr.pkl.gz
+```
+
+`cmp` agrees on both pairs, and both runs printed the identical §7 metrics table and stopped at
+the same iteration (83 refit, 79 split). The committed files are runA's.
+
+**The gzip was not masking a difference underneath.** Unpickled, the new estimators and the v0.1.1
+ones they replace predict identically — maximum absolute difference **0.0** over 5,000 probe rows,
+for both variants, same `n_iter_`, same number of predictors — and the only metadata that changed
+is the removal of `trained_utc`. Nothing in this card moved because of the fix.
+
+**What is claimed, exactly.** Two training runs write the same file. The file is not a fixed point
+of load-and-resave: `save_model(load_bundled_model(p), p)` returns 124,328 bytes for the split
+artefact against the committed 124,333, and 132,320 against 132,321 for the refit. That is
+`pickle`'s framing, not the model — decompressed, the round trip is 336,411 bytes against 336,401
+and the first differing byte is a `FRAME` length. `pickle` sizes its frames by accumulated bytes,
+and a re-pickled object graph shares its strings differently after a load, so the boundaries move.
+Two fresh processes doing a load-and-resave agree with each other to the byte; they simply do not
+agree with a training run, and the estimator is identical across all of them.
 
 **What is still not guaranteed.** Determinism here means *this machine, this scikit-learn, this
 NumPy*. `HistGradientBoostingRegressor` reduces its histograms across OpenMP threads, so a
@@ -293,8 +352,8 @@ outright if the model was fitted on those rows or if it does not record its spli
 **Why ship both rather than only the split model.** Only the refit model should be used to estimate
 anything, and only the split model can be honestly scored. Shipping one forces either a deployed
 model that is worse than it needs to be, or a metrics table nobody can check without a 1.2 GB
-download and a full refit. Two 130 KB files is a cheaper answer than either. See §6.1 for what is
-inside them.
+download and a full refit. Two files of 132,321 and 124,333 bytes are a cheaper answer than
+either. See §6.1 for what is inside them.
 
 ## 6. Features
 

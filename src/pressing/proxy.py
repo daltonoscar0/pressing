@@ -85,6 +85,40 @@ nothing but the row order gave 0.369387, 0.374414 and 0.368491, and the frame th
 v0.1.0 artefact came from gave 0.390659 -- a band of roughly 0.368 to 0.391 on
 one machine with one dataset.
 
+The **files** are reproducible too, which is a stricter claim and was not true
+through v0.1.1. Two things in the write path read a clock. The gzip header
+stamps ``time.time()`` into bytes 4:8 -- the shipped split artefact carried
+mtime 1787773230 -- and :func:`train_from_cache` stamped a wall-clock
+``trained_utc`` into the metadata *inside* the pickle, where it changed the
+compressed length as well as the content. Both are gone: :func:`save_model`
+writes :data:`ARTEFACT_GZIP_MTIME`, and no metadata field reads a clock.
+Measured, two fresh processes each running :func:`train_from_cache` end to end
+over the whole cache and writing into its own directory, both runs agreeing:
+
+- ``proxy_gbr.pkl.gz``, 132,321 bytes, SHA-256
+  ``94f6af0f22ffa5b52b208efb8756969b0a3b33a3dead91b87eed2bcb12d0a3ed``
+- ``proxy_gbr_split.pkl.gz``, 124,333 bytes, SHA-256
+  ``1364b8d9a831313b28c9f1c43ce61085f33ad7da0d88bdd47eedd82bdab5d22e``
+
+The gzip was not hiding a difference underneath. Unpickled, the trees of both
+new artefacts predict identically to the v0.1.1 artefacts they replace --
+maximum absolute difference 0.0 over 5,000 probe rows, identical ``n_iter_``
+(83 refit, 79 split) -- and the only metadata that moved is the removal of
+``trained_utc``. ``tests/test_proxy.py`` asserts the header mtime and the
+save-twice identity.
+
+**The claim is "train twice, get the same file", not "the file is a fixed
+point".** ``save_model(load_bundled_model(path), path)`` does *not* rewrite the
+committed bytes: measured, the split artefact comes back 124,328 bytes against
+the committed 124,333, and the refit 132,320 against 132,321. The cause is
+pickle's own framing, not the model. Decompressed, the round-tripped payload is
+336,411 bytes against the original's 336,401 and the first byte that differs is
+a ``FRAME`` length -- ``pickle`` places frame boundaries by accumulated size, so
+a re-pickled object graph, whose string objects are shared differently after a
+load, frames differently. The two payloads describe the same estimator. Two
+fresh processes each doing a load-and-resave agree with each other exactly; they
+just do not agree with a training run.
+
 Licence
 -------
 StatsBomb data is never committed. It is cached under the gitignored
@@ -2446,8 +2480,26 @@ def bundled_model_path(variant: str = "refit") -> Path:
     return Path(__file__).resolve().parents[2] / "models" / MODEL_VARIANTS[variant]
 
 
+#: gzip header mtime for every artefact this module writes.
+#:
+#: ``gzip.open`` stamps ``time.time()`` into header bytes 4:8, so two training
+#: runs that fit bit-identical trees still produced different files. Measured on
+#: the shipped split artefact before this was fixed: the header read
+#: ``1f8b 0808 2e41 8f6a`` -- flags ``0x08`` (a filename follows) and mtime
+#: ``0x6a8f412e`` = 1787773230 -- and every rewrite moved those four bytes, which
+#: is the whole of the three-byte size wobble the v0.1.1 audit saw. Zero is the
+#: value the gzip format reserves for "no timestamp available", so a reader loses
+#: nothing: *when* an artefact was built is a git question, not a file-header one.
+ARTEFACT_GZIP_MTIME: Final[int] = 0
+
+
 def save_model(model: ProxyModel, path: Path | str | None = None) -> Path:
-    """Serialise a fitted model to a gzipped pickle.
+    """Serialise a fitted model to a gzipped pickle, byte-reproducibly.
+
+    The output is a pure function of the model, the destination *basename* (gzip
+    stores it in the header) and the sklearn version. Nothing here reads a clock:
+    see :data:`ARTEFACT_GZIP_MTIME` for the header field that used to, and
+    :func:`train_from_cache` for the metadata field that used to.
 
     Args:
         model: The fitted model.
@@ -2461,8 +2513,16 @@ def save_model(model: ProxyModel, path: Path | str | None = None) -> Path:
     destination = Path(path) if path is not None else bundled_model_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
     model.metadata = {**model.metadata, "sklearn_version": sklearn_version}
-    with gzip.open(destination, "wb", compresslevel=9) as handle:
-        pickle.dump(model, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    payload = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
+    with destination.open("wb") as raw:
+        with gzip.GzipFile(
+            filename=destination.name,
+            mode="wb",
+            compresslevel=9,
+            fileobj=raw,
+            mtime=ARTEFACT_GZIP_MTIME,
+        ) as handle:
+            handle.write(payload)
     return destination
 
 
@@ -2654,6 +2714,14 @@ def train_from_cache(
     to score the refit one, so the confusion is now an exception rather than a
     warning in a document.
 
+    Neither model's metadata carries a training timestamp. It used to carry
+    ``trained_utc``, read off the wall clock, which put a fresh string inside the
+    pickle on every run and made the artefacts impossible to reproduce byte for
+    byte however deterministic the fit was. Nothing in the repository read it.
+    Everything that matters -- which matches, which target, which split, which
+    sklearn -- is recorded in fields that are functions of the inputs, and *when*
+    the file was built is a question for ``git log``.
+
     Args:
         cache_dir: StatsBomb cache root.
         competitions: ``(competition_id, season_id)`` pairs to train on.
@@ -2688,7 +2756,6 @@ def train_from_cache(
     train_ids = sorted(int(v) for v in labelled.loc[train_mask, "match_id"].unique())
     test_ids = sorted(int(v) for v in labelled.loc[test_mask, "match_id"].unique())
     common: dict[str, Any] = {
-        "trained_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         "competitions": [
             f"{c} {s}" for c, s in
             listing[["competition", "season"]].drop_duplicates().to_numpy().tolist()

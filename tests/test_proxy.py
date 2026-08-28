@@ -9,6 +9,7 @@ runs.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -880,6 +881,59 @@ def test_refitting_the_same_rows_twice_gives_identical_predictions(
     second = proxy.train(toy_dataset, toy_dataset["recovery_360"])
     assert np.array_equal(first.predict(toy_dataset), second.predict(toy_dataset))
     assert first.estimator.n_iter_ == second.estimator.n_iter_
+
+
+def test_saving_the_same_model_twice_gives_byte_identical_files(
+    toy_dataset: pd.DataFrame, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministic fit is not a reproducible file, and this is the gap.
+
+    Up to v0.1.1 ``save_model`` went through ``gzip.open``, which writes
+    ``time.time()`` into gzip header bytes 4:8. Two writes of one unchanged model
+    a second apart therefore differed at byte offset 4 and nowhere else, which is
+    how the committed artefacts kept changing under a fit that had already been
+    made deterministic. The shipped split artefact carried mtime 1787773230.
+    """
+    model = proxy.train(toy_dataset, toy_dataset["recovery_360"], metadata={"note": "toy"})
+    first = (tmp_path / "a") / "toy.pkl.gz"
+    second = (tmp_path / "b") / "toy.pkl.gz"
+    # Move the clock a year between the two writes rather than sleeping. Under
+    # the old code path this alone made the files differ.
+    monkeypatch.setattr(time, "time", lambda: 1_700_000_000.0)
+    proxy.save_model(model, first)
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    proxy.save_model(model, second)
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_the_artefact_header_carries_no_timestamp(
+    toy_dataset: pd.DataFrame, tmp_path: Path
+) -> None:
+    """Header bytes 4:8 must read zero, the value gzip reserves for "unknown"."""
+    model = proxy.train(toy_dataset, toy_dataset["recovery_360"])
+    header = proxy.save_model(model, tmp_path / "toy.pkl.gz").read_bytes()[:10]
+    assert header[:2] == b"\x1f\x8b"
+    assert int.from_bytes(header[4:8], "little") == proxy.ARTEFACT_GZIP_MTIME == 0
+
+
+def test_the_shipped_artefacts_carry_no_timestamp_of_any_kind() -> None:
+    """No committed artefact may record a clock, in its header or its metadata.
+
+    A wall-clock field inside the pickle is worse than one in the header: it is
+    compressed, so it changes the file's length as well as its content. The same
+    model saved with three different ``trained_utc`` strings came out at 124,366,
+    124,366 and 124,356 bytes.
+    """
+    for variant in ("refit", "split"):
+        path = proxy.bundled_model_path(variant)
+        if not path.exists():  # pragma: no cover - artefact-free checkout
+            pytest.skip("no bundled proxy models in this checkout")
+        assert int.from_bytes(path.read_bytes()[4:8], "little") == 0, variant
+        metadata = proxy.load_bundled_model(variant=variant).metadata
+        assert "trained_utc" not in metadata, variant
+        assert not [
+            key for key in metadata if "utc" in key.lower() or "timestamp" in key.lower()
+        ], variant
 
 
 # --------------------------------------------------------------------------- #

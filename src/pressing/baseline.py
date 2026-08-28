@@ -8,10 +8,12 @@ the ball on the opponent's byline and your whole team is already upfield around
 it; lose it on your own edge-of-box and the opponent owns everything in front
 of you. Measured on Metrica game 1, over the 255 scored losses, a straight line
 in the attacking fraction of the turnover explains ``R2 = 0.8212`` of the
-loss-level variance, and averaged up to the 27 players the report prints, a
-cubic in that same fraction predicts the printed ``Recovery 5 s`` column at
-``r = +0.9770`` (``R2 = 0.9546``, Spearman ``+0.9383``). The player's own mean
-turnover position, with nothing else in the model, reaches ``R2 = 0.9583``.
+loss-level variance, and averaged up to the 27 players with at least one
+credited loss, a cubic in that same fraction predicts the printed
+``Recovery 5 s`` column at ``r = +0.9771`` (``R2 = 0.9547``, Spearman
+``+0.9402``). The player's own mean turnover position, with nothing else in the
+model, reaches ``R2 = 0.9583``. Over only the 22 rows that print a value the
+cubic still reaches ``r = +0.9691`` (``R2 = 0.9391``).
 
 So a per-player *level* is a map of where that player stands. The only number
 with a chance of being about pressing is a **residual**::
@@ -86,7 +88,7 @@ instant it starts from.** Measured directly, ``r(recovery, share_t0_area) =
 +0.9740`` over the same 487 losses. The residual is what the five seconds add
 to the geometry -- which is the only part that could be pressing.
 
-Width, for the record, earns ``+0.0016`` on top of position alone and
+Width, for the record, earns ``+0.0015`` on top of position alone and
 ``+0.0005`` on top of the full model. Wide losses are not meaningfully
 different from central ones once ``x`` and the shape are known. It is kept
 because it costs nothing and because the question was worth answering.
@@ -99,37 +101,61 @@ that the raw column does not. :func:`permutation_between_player` runs the
 the values across losses, and ask how often chance spreads the per-player means
 as far apart as reality did.
 
-Metrica game 1 alone, players with at least five losses in the column, which is
-the report's own view of its own match:
+Every p below is a Monte-Carlo estimate, so it is only reproducible with its
+recipe stated. All of them: ``min_count=5``, ``n_shuffles=5000``, and a fresh
+``numpy.random.default_rng(0)`` for each row of each table. A different seed
+moves these p-values by about ±0.01 and moves none of the conclusions.
+
+**Metrica game 1 alone**, on ``data/demo/metrica_game_1_tracking.parquet`` --
+the asset the report itself reads, 805 credited presser-losses over 255 scored
+losses. Values are shuffled across all losses, not within a squad. The residual
+here is the **in-sample** one: with a single match in the frame
+:func:`add_expected_recovery` fits and scores on the same rows and sets
+``residual_out_of_sample`` to ``False``, and that is the number the report
+computes for its own match.
 
 =========================  =========  ===========  ===========  =======
 column                     players    observed sd  null median  p
 =========================  =========  ===========  ===========  =======
-``recovery`` pooled        26         0.0582       0.0414       0.0154
-``recovery`` build-up      14         0.0174       0.0221       0.8696
-``recovery`` middle        21         0.0355       0.0291       0.1144
-``recovery`` final third   19         0.0336       0.0279       0.1502
-residual pooled            26         0.0115       0.0112       0.4371
-residual build-up          14         0.0154       0.0197       0.8848
-residual middle            21         0.0153       0.0146       0.4087
-residual final third       19         0.0141       0.0154       0.6819
+``recovery`` pooled        26         0.0581       0.0415       0.0126
+``recovery`` build-up      14         0.0174       0.0221       0.8806
+``recovery`` middle        21         0.0355       0.0289       0.1200
+``recovery`` final third   19         0.0336       0.0279       0.1662
+residual pooled            26         0.0109       0.0110       0.5167
+residual build-up          14         0.0134       0.0197       0.9638
+residual middle            21         0.0158       0.0143       0.2785
+residual final third       19         0.0137       0.0152       0.7073
 =========================  =========  ===========  ===========  =======
 
-Both matches together, 49 player-match units, shuffling only within a team and
-a match so that neither a fixture effect nor a team effect can masquerade as a
-player one:
+Up to v0.1.1 those residual rows read 0.0115 / 0.0112 / 0.4371 and so on. Those
+were not the in-sample residual at all: they were the **two-match out-of-fold**
+residual restricted to game-1 rows, which is a different fit under a caption
+saying "the report's own view of its own match". For the record, that fit gives
+pooled 0.0116 / 0.0112 / ``p = 0.4303``, build-up 0.0154 / 0.0196 / 0.8810,
+middle 0.0154 / 0.0147 / 0.4029, final third 0.0141 / 0.0154 / 0.6715. Both fits
+say noise; only one of them is the one the report runs.
+
+The report does not print the unstratified pooled p either. It shuffles inside a
+squad, so that a difference between the two teams cannot arrive as a difference
+between players: on the same match and the same in-sample residual that is
+``p = 0.6643``, against 0.5167 unstratified.
+
+**Both matches together**, from the raw Metrica CSVs, 49 player-match units,
+shuffling only within a team and a match so that neither a fixture effect nor a
+team effect can masquerade as a player one. The residual here is out-of-fold by
+construction -- each match is predicted by a model fitted on the other:
 
 =========================  =========  ===========  ===========  =======
 column                     players    observed sd  null median  p
 =========================  =========  ===========  ===========  =======
-``recovery`` pooled        49         0.0508       0.0447       0.0992
-``recovery`` build-up      33         0.0222       0.0293       0.9966
-``recovery`` middle        40         0.0374       0.0390       0.6715
-``recovery`` final third   40         0.0409       0.0276       0.0008
-residual pooled            49         0.0144       0.0134       0.1944
-residual build-up          33         0.0224       0.0261       0.9988
-residual middle            40         0.0155       0.0181       0.9522
-residual final third       40         0.0165       0.0184       0.8762
+``recovery`` pooled        49         0.0508       0.0447       0.0976
+``recovery`` build-up      33         0.0222       0.0293       0.9960
+``recovery`` middle        40         0.0374       0.0389       0.6747
+``recovery`` final third   40         0.0409       0.0277       0.0004
+residual pooled            49         0.0144       0.0134       0.1902
+residual build-up          33         0.0224       0.0262       0.9984
+residual middle            40         0.0155       0.0181       0.9556
+residual final third       40         0.0165       0.0184       0.8676
 =========================  =========  ===========  ===========  =======
 
 Read those two tables honestly, because they say the same thing twice.
@@ -138,15 +164,16 @@ The three per-phase columns -- the comparison the report tells a coach to make
 -- do not clear the test. In build-up the real spread between players is
 *smaller* than chance, in both matches and by a wide margin. The one column
 that does clear it is ``recovery`` in the final third across both matches, at
-``p = 0.0008``; residualise it and it evaporates to ``p = 0.8762``. That is the
+``p = 0.0004``; residualise it and it evaporates to ``p = 0.8676``. That is the
 audit's whole point restated by the fix: what separates players in that column
 is where they were standing, and nothing else.
 
-And the residual, the number this module exists to compute, separates players
-at ``p = 0.4371`` on the report's own match and ``p = 0.1944`` on both matches
-pooled. **There is no per-player counter-pressing effect detectable in this
-data.** The residual is the honest number and the honest number is noise. Print
-it with its interval, or do not print it.
+And the residual, the number this module exists to compute, separates players at
+``p = 0.5167`` on the report's own match -- ``p = 0.6643`` shuffled inside a
+squad, which is the figure the report prints -- and at ``p = 0.1902`` on both
+matches pooled. **There is no per-player counter-pressing effect detectable in
+this data.** The residual is the honest number and the honest number is noise.
+Print it with its interval, or do not print it.
 
 The minimum count
 -----------------
@@ -155,18 +182,31 @@ The rule, stated before the arithmetic: *print a per-player value only when its
 in.* An interval wider than the table's entire range orders nobody against
 anybody; it is a decoration with three decimal places.
 
-Over the 1,595 player-loss credits of the two matches:
+The two matches yield **1,604** player-loss credits (806 in game 1, 798 in game
+2) over 53 player-match units. The per-loss sd below is measured over all 1,604.
+The spread of the means is measured over the **1,595** credits belonging to the
+49 units with at least five, because a unit with one credit has a mean that is
+that credit and would widen the range without carrying any information:
 
 =================  ============  ==============  ================  ==========
 column             per-loss sd   range of means  needed for range  for one sd
 =================  ============  ==============  ================  ==========
-``recovery``       0.1978        0.2432          11                233
-residual           0.0511        0.0703          9                 194
+``recovery``       0.1978        0.2432          10.2 -> 11        233.0
+residual           0.0511        0.0703          8.1 -> 9          193.9
 =================  ============  ==============  ================  ==========
 
+"Needed for range" is ``(2 * 1.96 * per-loss sd / range of means) ** 2``, the
+count at which the interval's full width drops below the range; "for one sd"
+puts the between-unit sd (0.0508 and 0.0144) in the denominator instead.
+Restricting the per-loss sd to the same 1,595 credits changes nothing that
+matters: 10.1 -> 11, 232.2, 8.1 -> 9, 193.4.
+
 :data:`MIN_LOSSES_FOR_PLAYER` is therefore **11**, the stricter of the two, so
-one threshold covers both columns. On Metrica game 1 it prints 22 of the 27
-rows the report currently prints and suppresses 5.
+one threshold covers both columns. On Metrica game 1 the report prints 28 rows,
+14 per squad, of which the threshold lets 22 show a value and suppresses 6.
+(27 of the 28 carry at least one credited loss -- 13 home, 14 away -- and that
+27 is the population the position-dominance figure above is measured over, not
+the number of printed rows.)
 
 The right-hand column is the one to dwell on. Separating two *typical* players
 -- one between-player standard deviation apart -- needs about 233 nearby losses
@@ -285,11 +325,12 @@ RESIDUAL_COLUMNS: Final[tuple[str, ...]] = ("recovery_expected", "recovery_resid
 #: Derived, not chosen: it is the count at which a 95% bootstrap interval on the
 #: player's mean becomes narrower than the full range of player means in the
 #: same column, which is the least a number must manage before it can order
-#: anybody against anybody. Measured over the 1,595 player-loss credits of the
-#: two Metrica matches that is 11 for ``recovery`` and 9 for the residual; 11 is
-#: the stricter and covers both. See the module docstring, including the 194 to
-#: 233 losses a player would actually need before the number separates them
-#: from a typical teammate.
+#: anybody against anybody. Measured over the 1,604 player-loss credits of the
+#: two Metrica matches -- against the spread of means of the 49 player-match
+#: units holding 1,595 of them -- that is 11 for ``recovery`` and 9 for the
+#: residual; 11 is the stricter and covers both. See the module docstring,
+#: including the 194 to 233 losses a player would actually need before the
+#: number separates them from a typical teammate.
 MIN_LOSSES_FOR_PLAYER: Final[int] = 11
 
 _TEAMS: Final[tuple[str, str]] = ("home", "away")
@@ -996,11 +1037,13 @@ def permutation_between_player(
     than one match. Without it the shuffle moves a value from one match into
     another, so any match-level offset in the column masquerades as
     between-player spread and the test reports a signal that is really a
-    fixture. Measured on the two Metrica matches, whose mean residuals differ by
-    0.0103 (``-0.00474`` against ``+0.00552``), the pooled residual test returns
-    ``p = 0.0036`` unstratified, ``p = 0.0226`` stratified by match and
-    ``p = 0.1944`` stratified by match and team -- one apparent finding and two
-    honest nulls, from the same 5,000 shuffles and the same numbers.
+    fixture. Measured on the two Metrica matches, whose mean out-of-fold
+    residual per credited presser differs by 0.0103 (``-0.00474`` in game 1
+    against ``+0.00552`` in game 2), the pooled residual test returns
+    ``p = 0.0024`` unstratified, ``p = 0.0236`` stratified by match and
+    ``p = 0.1902`` stratified by match and team -- one apparent finding and two
+    honest nulls, from the same 5,000 shuffles, the same numbers and the same
+    ``default_rng(0)``.
 
     Args:
         values: Per-loss values, e.g. ``recovery`` or ``recovery_residual``.
