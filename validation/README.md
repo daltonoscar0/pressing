@@ -1,7 +1,7 @@
 # Validation: pitch control against the Friends of Tracking reference
 
 `pitch_control_validation.ipynb` is the evidence for the project's pitch-control acceptance
-criterion — that `pressing.pitchcontrol` reproduces the published Friends of Tracking reference
+criterion, that `pressing.pitchcontrol` reproduces the published Friends of Tracking reference
 implementation with a Pearson correlation above 0.95. It is committed **with its outputs**, so the
 number below can be read without running anything.
 
@@ -27,14 +27,14 @@ HEADLINE: pressing.pitchcontrol vs the Friends of Tracking reference implementat
 ```
 
 At the reference's own no-clamp convention and in float64, the agreement is exact to floating-point
-rounding on every possession loss in the match — not "above the threshold", but the same numbers.
+rounding on every possession loss in the match, not "above the threshold", but the same numbers.
 The shipped configuration (float32, `clamp="renormalise"`) scores a pooled r of 0.999563, with one
 event of 257 below 0.95; section 9 of the notebook shows that gap is entirely the deliberate
 probability clamp described under **Caveats**, not a modelling difference.
 
 ## Re-measured for the v0.1.1 tag
 
-The notebook was re-executed from a clean kernel into `out/` — leaving the committed file untouched —
+The notebook was re-executed from a clean kernel into `out/`, leaving the committed file untouched -
 over the same 257 events and the same reference grid, to confirm nothing had drifted:
 
 ```sh
@@ -65,13 +65,13 @@ else the laptop was doing.** Two runs are recorded in this repository:
 | run | reference total | per surface | ours (shipped config) | per surface | ratio |
 |---|---:|---:|---:|---:|---:|
 | the committed notebook's own timing cell | 248.28 s | 0.9661 s | 4.04 s | 0.0157 s | **61.5x** |
-| the v0.1.1 rerun above, at a 1-minute load average of 4.35 → 6.12 | 151.61 s | 0.5899 s | 2.48 s | 0.0096 s | **61.2x** |
+| the v0.1.1 rerun above, at a 1-minute load average of 4.35 -> 6.12 | 151.61 s | 0.5899 s | 2.48 s | 0.0096 s | **61.2x** |
 
 The absolute totals differ by a factor of 1.6 between those two runs of identical code on identical
 data. The ratio moves by 0.3x and the correlations do not move at all. Earlier versions of this file
 carried two separate timing paragraphs quoting a third and fourth pair of figures with different
 ratios; they disagreed with each other, neither could be tied to a run recorded here, and they have
-been removed rather than reconciled. That margin — sixty-something to one — is the reason the demo
+been removed rather than reconciled. That margin, sixty-something to one, is the reason the demo
 fits its runtime budget: a straight port of the reference's per-cell Python loop would spend minutes
 on pitch control alone in a single match.
 
@@ -93,7 +93,7 @@ on pitch control alone in a single match.
 * **Data.** Metrica sample match 1, loaded by the reference's own `Metrica_IO` and
   `Metrica_Velocities` and fed to both implementations. That is deliberate: this notebook tests our
   pitch-control mathematics, not our loader.
-* **Event set.** All 257 `BALL LOST` events — the project's counter-press trigger — rather than a
+* **Event set.** All 257 `BALL LOST` events, the project's counter-press trigger, rather than a
   hand-picked sample. `BALL OUT` is reported separately by the product and is not compared here.
 * **Held fixed for an apples-to-apples comparison.** The reference's own grid
   (`n_grid_cells_x=50`, `field_dimen=(106., 68.)` → shape `(32, 50)`), the reference's model
@@ -101,7 +101,7 @@ on pitch control alone in a single match.
   semantics (tracking snapshot from the event row's `Start Frame`, ball from the event row's
   `Start X`/`Start Y`, **not** the tracked ball columns), and **offsides disabled on both sides**.
 * **Alignment guards, all asserted.** Shape is `(32, 50)`; `corr(ours, flipud(ref))` must be lower
-  than `corr(ours, ref)` — a y flip is the one misalignment that neither a shape check nor a sign
+  than `corr(ours, ref)`, a y flip is the one misalignment that neither a shape check nor a sign
   check catches, and it costs about 0.4 of correlation without looking obviously wrong; `corr` must
   be positive, since an attacking/defending swap gives exactly −1.
 * **Failures are counted, not dropped.** Both implementations are wrapped per event and any
@@ -116,11 +116,11 @@ on pitch control alone in a single match.
   unit-tested function. The surfaces the PDF renders are on the 105 x 68 grid and are therefore not
   the arrays compared here.
 * **One deliberate divergence: probability clamping.** Forward Euler takes its final step whole, so
-  the two teams' probabilities can end up summing above 1 — on 0.675% of cells in this match, and up
+  the two teams' probabilities can end up summing above 1, on 0.675% of cells in this match, and up
   to 2.80 on the worst cell. The reference returns those untouched (its own sanity check
   `assert 1 - checksum < model_converge_tol` is one-sided and never fires on an overshoot), and its
   surface does reach 1.005366 at one cell. Our default renormalises them. Every disagreement above
-  0.01 between the shipped default and the reference sits on such a cell — the notebook asserts
+  0.01 between the shipped default and the reference sits on such a cell, the notebook asserts
   exactly that. We would rather diverge from the reference than emit a probability above 1 into a
   coach-facing report.
 * **The EPV grid has no published provenance.** `reference/EPV_grid.csv` ships in the same MIT

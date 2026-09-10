@@ -9,7 +9,7 @@ also ships a weaker event-only estimate for matches that have no tracking, and a
 a whole competition and puts the ranking next to what the players cost.
 
 **Who it is for.** A coach or an analyst who wants the counter-press described by a number that comes
-from where the players actually were rather than from someone's eye — and anyone who wants to read how
+from where the players actually were rather than from someone's eye, and anyone who wants to read how
 such a number is built, and where it stops being trustworthy. Everything below that looks like a claim
 is a measurement, and the command that produces it is written next to it.
 
@@ -24,7 +24,7 @@ been kept up to date.
 
 Recovery is a share of modelled pitch control, and control of ground is mostly geography. On the
 bundled match the mean recovery share is **0.257** for losses in a team's own build-up third and
-**0.701** for losses in the opponent's third — a near-threefold gradient that has nothing to do with
+**0.701** for losses in the opponent's third, a near-threefold gradient that has nothing to do with
 pressing intensity.
 
 That gradient survives all the way up into the player table, which is the output a coach will actually
@@ -38,9 +38,9 @@ circulate:
 
 **Squared, that is 95% of everything that separates one player from another in that column.** Sorting
 it sorts the squad by where it plays. What is left after position is removed has sd 0.0186 against the
-column's own sd of 0.0813 — under a quarter of the spread.
+column's own sd of 0.0813, under a quarter of the spread.
 
-### 2. "Compare within a phase" — the remedy this report used to prescribe — does not rescue it
+### 2. "Compare within a phase", the remedy this report used to prescribe, does not rescue it
 
 Each per-phase player column gets a 5,000-shuffle permutation test: hold every player's loss count
 fixed, reshuffle the values among players, and ask how often chance spreads the per-player means as
@@ -53,31 +53,31 @@ far apart as reality did.
 | final third | 19 | 0.0336 | 0.0279 | **0.17** |
 | pooled recovery | 26 | 0.0581 | 0.0415 | 0.013 |
 
-Shuffling **inside each squad**, so that a team-level offset cannot masquerade as a player one — which
-is what the report itself does — those three p-values are 0.97, 0.86 and 0.16. Either way: **in
+Shuffling **inside each squad**, so that a team-level offset cannot masquerade as a player one, which
+is what the report itself does, those three p-values are 0.97, 0.86 and 0.16. Either way: **in
 build-up the real spread between players is smaller than chance.** The only column that clears the test
 is the pooled one, and the pooled one is the 95%-field-position column above.
 
 ### 3. The conditional baseline is now built, and it says there is nothing there
 
 `pressing.baseline` fits what a team losing the ball *in that place, in that shape* was already going
-to get — a cubic in `x_norm`, the width, and four shape features read off the tracking frame at the
-turnover — and the player table prints `recovery − expected` beside the level. Cross-validated by
+to get, a cubic in `x_norm`, the width, and four shape features read off the tracking frame at the
+turnover, and the player table prints `recovery − expected` beside the level. Cross-validated by
 match it reaches R² = 0.9240 out of sample against 0.8368 for position and width alone
 (`pressing.baseline`, measured over the 487 scored losses of Metrica games 1 and 2).
 
 Then the residual is tested the same way as everything else, and:
 
 - it separates players at **p = 0.67** on the bundled match;
-- **every one of the 22 printed players has a 95% interval on it that includes zero** — 0 of 22 clear;
+- **every one of the 22 printed players has a 95% interval on it that includes zero**, 0 of 22 clear;
 - the expectation was fitted on the one match it scores, so it is in-sample and if anything flatters
   itself.
 
 ### So, in this project's own voice
 
 **A per-player counter-press number is not defensible on two tracked matches, and this repository will
-not pretend otherwise.** The counts are solid — who was near the ball when it was lost, how often, in
-which third — and everything to the right of them is context for those counts, not a ranking of
+not pretend otherwise.** The counts are solid, who was near the ball when it was lost, how often, in
+which third, and everything to the right of them is context for those counts, not a ranking of
 players. The median player in the bundled match has 24 nearby losses; `pressing.baseline` measures the
 requirement at roughly 233 to separate two typical players on the level and 194 on the residual, which
 is eight to ten full matches each. No cell prints at all below 11 losses, which silences every number
@@ -96,14 +96,14 @@ statement above as being about those two matches, because that is all it is.
 
 `pressing demo` writes a six-page A4 PDF:
 
-1. **Cover** — fixture, provider, frame rate, a head-to-head table with a `Better is` column and the
+1. **Cover**, fixture, provider, frame rate, a head-to-head table with a `Better is` column and the
    recovery-versus-regain correlation between the two rows that invite confusion, the field-position
    caveat, and a rolling-recovery sparkline.
-2. **Loss map** — every possession loss on one pitch in team colours, plus the build-up / middle /
+2. **Loss map**, every possession loss on one pitch in team colours, plus the build-up / middle /
    final-third table.
-3–4. **Top moments 1–4**, two per page: a pitch-control heatmap each, captioned with the minute, who
+3-4. **Top moments 1-4**, two per page: a pitch-control heatmap each, captioned with the minute, who
    lost the ball, who won it, the recovery share and the EPV swing.
-5. **Moment 5 in detail** — one full-width panel plus a t0 / t0+2s / t0+5s thumbnail strip.
+5. **Moment 5 in detail**, one full-width panel plus a t0 / t0+2s / t0+5s thumbnail strip.
 6. **Player table**, under a boxed warning that states this match's own measured version of §1, §2 and
    §3 above: minutes, losses nearby, recovery, the residual against the conditional baseline with its
    bootstrap interval, EPV swing and the three phase splits, each phase heading carrying its own
@@ -112,7 +112,7 @@ statement above as being about those two matches, because that is all it is.
 Every number in that warning is measured on the match in hand by `pressing.report.measure_disclosure`,
 so a report built on a different match prints that match's numbers rather than the ones above.
 
-`--all-panels DIR` additionally dumps one heatmap per scored possession loss — measured, **255 PNGs**
+`--all-panels DIR` additionally dumps one heatmap per scored possession loss, measured, **255 PNGs**
 on the bundled match. It took the process from 39.4 s to 97.9 s of CPU in the runs timed below. The
 PDF itself is always six pages.
 
@@ -161,10 +161,10 @@ one-minute load average recorded immediately before and after each:
 | run | font cache | load average, before → after | `real` | CPU (`user` + `sys`) | PDF |
 |---|---|---|---:|---:|---:|
 | 1 | cold (empty `MPLCONFIGDIR`) | 3.90 → 4.61 | 24.00 s | 57.3 s | 1,398,722 B |
-| 2 | warm | 4.88 → 5.68 | 14.95 s | 41.5 s | 1,398,722 B |
-| 3 | warm | 5.68 → 5.48 | 15.01 s | 41.6 s | 1,398,722 B |
+| 2 | warm | 4.88 -> 5.68 | 14.95 s | 41.5 s | 1,398,722 B |
+| 3 | warm | 5.68 -> 5.48 | 15.01 s | 41.6 s | 1,398,722 B |
 | 4 | warm, `--all-panels` | 6.75 → 5.95 | 72.58 s | 98.1 s | 1,398,722 B + 255 PNGs |
-| 5 | warm, **twelve CPU burners started deliberately** | 19.68 → 72.42 | **135.26 s** | 46.2 s | 1,398,722 B |
+| 5 | warm, **twelve CPU burners started deliberately** | 19.68 -> 72.42 | **135.26 s** | 46.2 s | 1,398,722 B |
 
 **Run 5 is the point of this table.** It is the same command, on the same laptop, minutes after run 2,
 with twelve busy-wait processes of my own added: **9.0x the wall clock on 1.1x the CPU**, and it misses
@@ -195,7 +195,7 @@ uv run pressing demo --out out/demo_report.pdf --team home --rank costly
 Runs the bundled match end to end. `--rank` chooses which five losses the moment pages print:
 `costly` (default, largest EPV swing), `recovered` (highest recovery share) or `conceded` (lowest).
 `recovered` is the spec's literal reading and is deliberately not the default: because recovery is
-driven by field position, it returns final-third losses and essentially nothing else — measured, 5 of
+driven by field position, it returns final-third losses and essentially nothing else, measured, 5 of
 5 for each team on the bundled match. `costly` is the ranking that can show a press that went wrong,
 and on this match it returns nine middle-third losses and one build-up loss across the two teams.
 
@@ -215,7 +215,7 @@ out/report.pdf
 
 Progress goes to stderr and the path to stdout, so `$(uv run pressing report ...)` is the path and
 nothing else. That run wrote a 1,398,707-byte PDF (15.76 s `real`, 42.4 s CPU, warm font cache, at a
-one-minute load average of 6.16 → 6.99; see the caveat above about quoting either).
+one-minute load average of 6.16 -> 6.99; see the caveat above about quoting either).
 
 Accepts three shapes of input: a `.parquet` tracking asset written by this package (with `--events`),
 a directory holding Metrica's `Sample_Game_N/` folders, or one of Metrica's raw
@@ -256,15 +256,15 @@ match_id,turnover_id,t,losing_team,winning_team,phase,recovery,epv_conceded,esti
 
 **Two lines of that header are known to be wrong and are printed here as they actually come out.** The
 fourth line quotes the *tracking* metric's phase means (0.26 / 0.47 / 0.70) above a column whose own
-gradient is +0.078, so a proxy build-up value of 0.47 — the proxy's own average — reads as an
+gradient is +0.078, so a proxy build-up value of 0.47, the proxy's own average, reads as an
 extraordinary press. The third rounds the top of a range to a single number. `pressing.proxy` has a
 corrected header (`recovery_phase_caveat`, which prints the model's own means and then forbids scaling
 against the tracking ones) and `pressing season` already uses it; the `pressing proxy` subcommand in
 `cli.py` does not yet. It is the first item in [TODO.md](TODO.md).
 
 Read [the metrics table below](#the-event-only-proxy-honest-numbers) before you quote any single value:
-the proxy is a rough ranking device, and every output built from it — the CSV header, the stdout
-summary, and the footer and metadata of any PDF rendered from proxy numbers — says so.
+the proxy is a rough ranking device, and every output built from it, the CSV header, the stdout
+summary, and the footer and metadata of any PDF rendered from proxy numbers, says so.
 
 ### `pressing season`
 
@@ -303,9 +303,9 @@ not the most recent one: La Liga's latest open season has 35 matches and its lar
 At every open-play possession loss:
 
 1. Take the frame where the ball changed hands. The team that **lost** it is the counter-pressing team.
-2. At six instants — the moment of the loss and each second after it out to five seconds — compute a
+2. At six instants, the moment of the loss and each second after it out to five seconds, compute a
    pitch-control surface on a 50 x 32 grid: for every cell, the probability that the counter-pressing
-   team would win the ball if it arrived there. The model is the Spearman one — time to intercept from
+   team would win the ball if it arrived there. The model is the Spearman one, time to intercept from
    each player's position and velocity, a logistic ramp on arrival, integrated forward along the ball
    flight.
 3. Average each surface over the pitch to get that team's share of control at that instant.
@@ -338,7 +338,7 @@ counted from the losing team's own goal:
 
 That is a near-threefold gradient from one end of the pitch to the other, and it dwarfs the difference
 between the two teams (0.238 against 0.279 in build-up). Compare within a phase, mind the sample size
-— build-up rests on 24 losses out of 255 in this match — and see §1–§3 above for how far that
+- build-up rests on 24 losses out of 255 in this match, and see §1-§3 above for how far that
 instruction actually gets you, which is not far.
 
 ### What the metric is not
@@ -356,7 +356,7 @@ Two further limits, both reported per loss rather than hidden:
 * The ball has no tracking row in **39.1%** of the bundled match's 145,006 frames, so inside a
   five-second window the ball position is sometimes carried forward from the last known frame. Every
   loss reports how often that happened in `n_ball_filled`.
-* One open-play loss in the bundled match cannot be located at all — no tracked ball at its end frame
+* One open-play loss in the bundled match cannot be located at all, no tracked ball at its end frame
   and no event coordinates either side. It is reported with `location_source == "none"` and skipped,
   not guessed: 256 losses detected, 255 scored. Having no position it has no pitch third either, which
   is why the cover counts 256 and page 2's phase table adds up to 255; both pages say so.
@@ -386,17 +386,17 @@ to nine.
 
 **Both rows matter, and the second is not hidden.** At the reference's own convention we reproduce it
 to floating-point rounding. The shipped default deliberately diverges: forward Euler takes its final
-integration step whole, so the two teams' raw probabilities can sum above 1 — measured maximum
+integration step whole, so the two teams' raw probabilities can sum above 1, measured maximum
 2.800681, and the reference's own surface reaches 1.005366 at one cell. We renormalise those cells
 rather than print a probability above 1 in a coach-facing report, and that one choice accounts for the
 whole gap, including the single event that falls to r = 0.943.
 
 **Speed.** The reference computes one surface with a Python loop over cells and this package computes
 it with array arithmetic. In the rerun above, on the same 257 events and the same grid, the reference
-took 151.61 s in total (0.5899 s per surface) against 2.48 s (0.0096 s per surface) — a **61.2x**
+took 151.61 s in total (0.5899 s per surface) against 2.48 s (0.0096 s per surface), a **61.2x**
 ratio, at a one-minute load average of 4.35 to 6.12. **Only the ratio is worth anything**: the
 committed notebook's own timing cell, from a different run on the same laptop, reads 248.28 s against
-4.04 s — the absolute totals differ by a factor of 1.6 and the ratio moves from 61.5x to 61.2x. The
+4.04 s, the absolute totals differ by a factor of 1.6 and the ratio moves from 61.5x to 61.2x. The
 correlations do not move at all. `validation/README.md` records both runs with what is known about the
 machine they were taken on. The margin is why the
 demo fits its runtime budget: a straight port of the reference loop would spend minutes on pitch
@@ -404,7 +404,7 @@ control in a single match.
 
 **What this is not.** It shows we agree with one published implementation of one model. It says nothing
 about whether that model predicts football, and it does not test the loader, the offside rule or the
-product's choice of ball position — those have their own tests.
+product's choice of ball position, those have their own tests.
 
 ## The event-only proxy: honest numbers
 
@@ -423,7 +423,7 @@ watermarked as an estimate wherever it appears.
 **The spec's training plan could not be built.** It asked for a Metrica + SkillCorner overlap.
 SkillCorner ships no event stream ("We are not an event data provider ourself"), its ten open matches
 are Australian A-League and StatsBomb open data has no Australian competition, and its
-`dynamic_events.csv` is derived from the same tracking that would produce our labels — training on it
+`dynamic_events.csv` is derived from the same tracking that would produce our labels, training on it
 would be circular. The labels come from **StatsBomb 360 freeze-frames** instead, split by match.
 
 **The data.** 101 matches downloaded across three competition-seasons (La Liga 2020/21, 1. Bundesliga
@@ -432,13 +432,13 @@ would be circular. The labels come from **StatsBomb 360 freeze-frames** instead,
 ship a well-formed 360 file whose `event_uuid`s intersect their own events file at exactly zero, which
 is an upstream inconsistency the pipeline degrades on rather than papering over. The counts, the
 competitions, the split and the metrics below are all recorded inside the committed artefacts and can
-be read out in a second — see the reproduce section.
+be read out in a second, see the reproduce section.
 
 The split is **by match, never by turnover**: 68 training matches (4,394 rows) against 29 held-out
 matches (1,801 rows), with an empty match-id intersection asserted in the tests. Splitting by turnover
 would put two losses from the same match five seconds apart on opposite sides of the split.
 
-The field-position gradient that dominates the true metric is almost gone from the label — mean
+The field-position gradient that dominates the true metric is almost gone from the label, mean
 `recovery_360` is 0.4636 in build-up, 0.4894 in the middle and 0.5420 in the final third, a spread of
 0.078 where the tracking truth has 0.444. The model inherits that compression, which is why **no
 output may print the tracking metric's phase means as a scale for a proxy number** (see the note on
@@ -451,9 +451,9 @@ metadata:
 
 | model | r | Spearman | MAE | RMSE | residual r after removing turnover `x` |
 |---|---:|---:|---:|---:|---:|
-| predict the training mean | — | — | 0.1029 | 0.1299 | 0.0806 |
+| predict the training mean |, |, | 0.1029 | 0.1299 | 0.0806 |
 | predict the mean of the pitch third | 0.1690 | 0.1813 | 0.1006 | 0.1283 | 0.0581 |
-| **predict from turnover `x` alone** | **0.1974** | 0.2107 | 0.1002 | 0.1277 | — |
+| **predict from turnover `x` alone** | **0.1974** | 0.2107 | 0.1002 | 0.1277 |, |
 | **full model** (29 features) | **0.3692** | 0.3884 | 0.0927 | 0.1212 | **0.3260** |
 
 `r` for the mean predictor is undefined, not zero: its predictions are constant. `residual r` is the
@@ -461,22 +461,22 @@ correlation between prediction and label after a smooth function of turnover `x`
 rows only, has been subtracted from both.
 
 **Those figures are quoted to four decimals because the refit is now deterministic.** Up to v0.1.0 it
-was not — `build_dataset` appended each match as its worker finished, so the training set's row order
+was not, `build_dataset` appended each match as its worker finished, so the training set's row order
 was a race and the early-stopping slice moved with it. v0.1.0 printed r = 0.390 from that regime and
 claimed cross-process agreement to within 0.001; two independent auditors measured 0.3803 and 0.3820,
-and the honest description of the old number is the top of a 0.368–0.391 band. The row order is now
+and the honest description of the old number is the top of a 0.368-0.391 band. The row order is now
 canonical and three fresh processes agree bit for bit; `models/MODEL_CARD.md` §5.1 records how that was
 established and what it cost.
 
 **Two artefacts ship, and scoring the wrong one lies to you.** `models/proxy_gbr.pkl.gz` is refitted on
-all 6,195 labelled rows, because that is the model you would want to run — so the held-out matches are
+all 6,195 labelled rows, because that is the model you would want to run, so the held-out matches are
 *inside* its training set and scoring it on them returns an in-sample number that means nothing.
 `models/proxy_gbr_split.pkl.gz` is the model the table above describes. Both now carry `fitted_on`,
 `train_match_ids` and `held_out_match_ids`, and `score_held_out` raises rather than returning the
 flattering number.
 
 **Read the table honestly.** The full model beats every baseline, and it knows something beyond field
-position — the x-only baseline reaches 0.197 and the residual correlation is still 0.326. But r = 0.37
+position, the x-only baseline reaches 0.197 and the residual correlation is still 0.326. But r = 0.37
 against a label is not a good number in absolute terms, and the predictions are badly shrunk: on the
 held-out matches the label has sd 0.1299 while the predictions have sd 0.0586, a spread ratio of 0.451.
 That is what a squared-error fit does when most of the target is unexplained. **Report ranks, never
@@ -494,8 +494,8 @@ them now.
 This is the number that decides how much the proxy can ever be worth, and it can be measured directly:
 the Metrica matches have both real 25 Hz tracking and real events, so the true metric and a simulated
 freeze-frame version of it can be computed on the same 487 possession losses. The simulation degrades
-the truth one step at a time, driven by **real** StatsBomb 360 sampling geometry — the offsets frames
-actually landed on and the actual `visible_area` polygons, anchored to the ball — transplanted onto
+the truth one step at a time, driven by **real** StatsBomb 360 sampling geometry, the offsets frames
+actually landed on and the actual `visible_area` polygons, anchored to the ball, transplanted onto
 Metrica, so the camera model is measured rather than invented. The run below drew 1,381 real 360
 windows from 20 matches; it was measured for the v0.1.0 tag and has not been re-run since, because it
 needs both caches and hours. The command that produced it is in the reproduce section.
@@ -520,7 +520,7 @@ What it says:
 2. **Assuming every player is stationary costs almost nothing** (r = 0.990). This is the assumption
    everyone worries about and it is not the problem.
 3. **The broadcast camera is the whole problem.** Only the players inside the polygon exist, and the
-   ones outside it are the ones far from the ball — exactly the asymmetry that creates the
+   ones outside it are the ones far from the ball, exactly the asymmetry that creates the
    field-position gradient. The gradient collapses from +0.433 to +0.076.
 4. **Restricting the integral to the visible polygon is worse, not better.** It looked like the more
    defensible choice; it was measured and rejected. `recovery_360` is the shipped target.
@@ -551,7 +551,7 @@ measured:
 | not found at all | 25 |
 | points on the scatter | **105** (of the 133 ranked, after excluding goalkeepers and players with no value) |
 
-The join is by normalised name, in tiers — full name, nickname, nickname plus the club the player
+The join is by normalised name, in tiers, full name, nickname, nickname plus the club the player
 appeared for that season, last two tokens. Of the 406 priced players, 297 were found by a Transfermarkt
 nickname, 74 by the full name, 34 needed the club to disambiguate and 1 fell through to the last-two-
 tokens rule. A name that still matched several Transfermarkt players is dropped with
@@ -575,9 +575,9 @@ worth in this sample, and the mild negative tilt in the raw-value column is what
 a handful of expensive forwards who press less, not evidence of anything. It is also 40 matches, not a
 season, and the run says so on stdout and again in the CSV header.
 
-Two things to keep straight in the output table. `counterpress_per_90` is a **count** — StatsBomb's own
+Two things to keep straight in the output table. `counterpress_per_90` is a **count**, StatsBomb's own
 `counterpress` flag, defined verbatim as a defensive action "within 5 seconds of an open play
-turnover", the same window this project's metric uses — and involves no model at all; it is the
+turnover", the same window this project's metric uses, and involves no model at all; it is the
 scatter's y axis and the ranking key. `mean_recovery_pressed` and `press_value_per_90` are **proxy
 estimates** and inherit every caveat in the section above. Minutes come from the lineup files'
 position intervals intersected with the real period clock, so a full match reads about 94 rather
@@ -585,7 +585,7 @@ than 90.
 
 ## Licence
 
-**This project's own code is MIT** — see [`LICENSE`](LICENSE), Copyright (c) 2026 Oscar Dalton. That
+**This project's own code is MIT**, see [`LICENSE`](LICENSE), Copyright (c) 2026 Oscar Dalton. That
 covers `src/`, `tests/`, `validation/pitch_control_validation.ipynb` and the documentation, and
 nothing else.
 
@@ -594,7 +594,7 @@ notices and must not be relabelled with this project's:
 
 - `validation/reference/LICENSE` and `data/epv/LICENSE.friends-of-tracking` are the *Friends of
   Tracking* MIT grant, Copyright (c) 2021 Friends-of-Tracking-Data-FoTD. Two copies because the
-  material is vendored in two places — the reference implementation under `validation/reference/` and
+  material is vendored in two places, the reference implementation under `validation/reference/` and
   the EPV grid under `data/epv/`. Both stay exactly as upstream wrote them.
 - `data/demo/` is derived from Metrica sample data, which is published under **no licence at all**. No
   grant is offered or implied for those two parquet files; `data/demo/NOTICE.md` says so, records the
@@ -609,10 +609,10 @@ full; `git ls-files data` is the check, not the working tree.
 
 | Source | Used for | Licence | How this repo treats it |
 |---|---|---|---|
-| [Metrica Sports sample data](https://github.com/metrica-sports/sample-data) | The bundled demo match, the metric's measured behaviour, the pitch-control validation | **None published.** GitHub reports `license: null`, which is all rights reserved by default. The README asks only that users be responsible with the data and acknowledge the source. | Credited by name here, in the PDF footer of every page, and wherever its numbers appear. The raw CSVs are **never committed**. What is committed is a *derived* asset — restructured, re-coordinated, rotated, quantised to int16 centimetres, velocities dropped — solely so the demo runs offline on a fresh clone, with [`data/demo/NOTICE.md`](data/demo/NOTICE.md) recording exactly how it differs, the upstream commit `e706dd50`, the sha256 and git blob id of every upstream file it came from, and an undertaking to remove it on request. `tests/fixtures/metrica/` holds **synthetic** files that copy the format only. |
-| [Friends of Tracking / LaurieOnTracking](https://github.com/Friends-of-Tracking-Data-FoTD/LaurieOnTracking) | Pitch-control reference implementation; the EPV grid | **MIT**, Copyright (c) 2021 Friends-of-Tracking-Data-FoTD | Vendored byte-for-byte with the MIT notice beside it, under `validation/reference/` and `data/epv/`, with `PROVENANCE.md` files recording the commit and the sha256 of every file. **The EPV grid is theirs and has no published provenance** — no fitting code, no source dataset, no documentation of what it was fitted on. It is used because it is redistributable and already the right shape, not because it is authoritative, and the report labels it as the Friends of Tracking grid rather than as our estimate. |
-| [StatsBomb open data](https://github.com/statsbomb/open-data) | Proxy training labels; season mode | **Restrictive.** The `LICENSE.pdf` "StatsBomb Public Data User Agreement" governs and is stricter than the repo README's attribution-only wording: clause 1.2.1 forbids you to "edit, distort, distribute, reproduce, sell or in any way provide the data to any external or third party"; clause 1.2.2 forbids commercially exploiting "the data or any analysis derived from the use of the Service"; clause 1.4 requires accrediting published analysis with the StatsBomb brand logo. | **Never committed, in any form** — it sits in gitignored `data/raw/statsbomb/`, fetched at one request per second. Attribution is stamped on every event-derived output: the proxy CSV header, the season CSV header, the scatter caption, the PDF footer. The committed model artefacts contain no rows, but they do embed StatsBomb's event-type vocabulary and three competition-season names as frozen encoder categories; `models/MODEL_CARD.md` §6.1 lists exactly what is in there. This tool is non-commercial personal analysis and carries no commercial framing. Note that handing a coach a PDF of StatsBomb-derived numbers sits close to clause 1.2.1 — read the agreement first. |
-| [dcaribou/transfermarkt-datasets](https://github.com/dcaribou/transfermarkt-datasets) | Market values for season mode | **CC0-1.0 over the repackaging only.** | CC0 covers dcaribou's repackaging, **not** the underlying rights: the data is scraped from Transfermarkt, whose own terms prohibit scraping. Values are Transfermarkt's community estimates — not fees, not wages, not audited. A column-reduced snapshot is committed under `data/transfermarkt/` so the join works offline, with its capture date and row counts in [`data/transfermarkt/NOTICE.md`](data/transfermarkt/NOTICE.md); the full tables stay in gitignored `data/raw/`. |
+| [Metrica Sports sample data](https://github.com/metrica-sports/sample-data) | The bundled demo match, the metric's measured behaviour, the pitch-control validation | **None published.** GitHub reports `license: null`, which is all rights reserved by default. The README asks only that users be responsible with the data and acknowledge the source. | Credited by name here, in the PDF footer of every page, and wherever its numbers appear. The raw CSVs are **never committed**. What is committed is a *derived* asset, restructured, re-coordinated, rotated, quantised to int16 centimetres, velocities dropped, solely so the demo runs offline on a fresh clone, with [`data/demo/NOTICE.md`](data/demo/NOTICE.md) recording exactly how it differs, the upstream commit `e706dd50`, the sha256 and git blob id of every upstream file it came from, and an undertaking to remove it on request. `tests/fixtures/metrica/` holds **synthetic** files that copy the format only. |
+| [Friends of Tracking / LaurieOnTracking](https://github.com/Friends-of-Tracking-Data-FoTD/LaurieOnTracking) | Pitch-control reference implementation; the EPV grid | **MIT**, Copyright (c) 2021 Friends-of-Tracking-Data-FoTD | Vendored byte-for-byte with the MIT notice beside it, under `validation/reference/` and `data/epv/`, with `PROVENANCE.md` files recording the commit and the sha256 of every file. **The EPV grid is theirs and has no published provenance**, no fitting code, no source dataset, no documentation of what it was fitted on. It is used because it is redistributable and already the right shape, not because it is authoritative, and the report labels it as the Friends of Tracking grid rather than as our estimate. |
+| [StatsBomb open data](https://github.com/statsbomb/open-data) | Proxy training labels; season mode | **Restrictive.** The `LICENSE.pdf` "StatsBomb Public Data User Agreement" governs and is stricter than the repo README's attribution-only wording: clause 1.2.1 forbids you to "edit, distort, distribute, reproduce, sell or in any way provide the data to any external or third party"; clause 1.2.2 forbids commercially exploiting "the data or any analysis derived from the use of the Service"; clause 1.4 requires accrediting published analysis with the StatsBomb brand logo. | **Never committed, in any form**, it sits in gitignored `data/raw/statsbomb/`, fetched at one request per second. Attribution is stamped on every event-derived output: the proxy CSV header, the season CSV header, the scatter caption, the PDF footer. The committed model artefacts contain no rows, but they do embed StatsBomb's event-type vocabulary and three competition-season names as frozen encoder categories; `models/MODEL_CARD.md` §6.1 lists exactly what is in there. This tool is non-commercial personal analysis and carries no commercial framing. Note that handing a coach a PDF of StatsBomb-derived numbers sits close to clause 1.2.1, read the agreement first. |
+| [dcaribou/transfermarkt-datasets](https://github.com/dcaribou/transfermarkt-datasets) | Market values for season mode | **CC0-1.0 over the repackaging only.** | CC0 covers dcaribou's repackaging, **not** the underlying rights: the data is scraped from Transfermarkt, whose own terms prohibit scraping. Values are Transfermarkt's community estimates, not fees, not wages, not audited. A column-reduced snapshot is committed under `data/transfermarkt/` so the join works offline, with its capture date and row counts in [`data/transfermarkt/NOTICE.md`](data/transfermarkt/NOTICE.md); the full tables stay in gitignored `data/raw/`. |
 | [SkillCorner open data](https://github.com/SkillCorner/opendata) | Evaluated and **not used** | MIT | Rejected on the facts, not the licence: no event stream, no competition overlap with StatsBomb, and its derived events come from the same tracking that would generate our labels. |
 
 ## Known limitations, and what I would do next
@@ -675,8 +675,8 @@ uv run pytest -q
 progress dots and not one `F`, `E`, `s` or `x`, so nothing is failing, skipped or expected-to-fail. It
 cost 299.6 s of CPU (226.9 user + 72.7 sys) on a contended machine; the wall clock it took there is not
 worth quoting and is shorter than the CPU total because parts of the suite score losses on a worker
-pool. The suite is slow on purpose — it scores real possession losses and builds real PDFs rather than
-mocking them — so budget minutes, not seconds, and do not assume it has hung. It is offline: no test
+pool. The suite is slow on purpose, it scores real possession losses and builds real PDFs rather than
+mocking them, so budget minutes, not seconds, and do not assume it has hung. It is offline: no test
 reads anything under gitignored `data/raw/` or opens a socket, and `tests/test_demo.py` asserts that
 the demo path never opens a `data/raw/` file.
 
@@ -686,12 +686,12 @@ Open items are in [TODO.md](TODO.md).
 
 The house rule is that every figure here is either (a) measured by one of the commands below, run on
 this machine while writing this file, or (b) explicitly attributed to the document that owns the
-measurement — `models/MODEL_CARD.md`, `pressing.baseline`'s module docstring, or the committed
+measurement, `models/MODEL_CARD.md`, `pressing.baseline`'s module docstring, or the committed
 notebook. Nothing is quoted from memory, and where a run disagreed with an older note the newer
 measurement is what is printed. Wall-clock timings are the exception the rule cannot fix: they are
 printed with the load average they were taken under and should not be expected to reproduce.
 
-**The two findings at the top of this README** — the field-position dominance of the player column and
+**The two findings at the top of this README**, the field-position dominance of the player column and
 the permutation tests. This is the same computation the PDF's own page-6 warning is built from, so the
 paper and this file cannot drift apart:
 
@@ -751,7 +751,7 @@ print("median nearby losses per printed player", float(printed["losses_nearby"].
 PY
 ```
 
-**The metric, the phase table, the distributions and the regain correlation** — the bundled match, no
+**The metric, the phase table, the distributions and the regain correlation**, the bundled match, no
 network:
 
 ```sh
@@ -782,7 +782,7 @@ print(summarise_match(losses))
 PY
 ```
 
-**How often the ball is untracked** — the same asset:
+**How often the ball is untracked**, the same asset:
 
 ```sh
 uv run python -c "
@@ -802,7 +802,7 @@ uptime
 wc -c out/demo_report.pdf
 ```
 
-**The pitch-control validation** — needs Metrica's CSVs under `data/raw/`. The committed notebook is
+**The pitch-control validation**, needs Metrica's CSVs under `data/raw/`. The committed notebook is
 the evidence and carries its outputs; `validation/README.md` documents the method. Re-executing it
 into `out/` leaves the committed notebook untouched:
 
@@ -827,8 +827,8 @@ print('label phase means', md['label_phase_means'])
 print(pd.DataFrame(md['held_out_metrics']).round(4).to_string(index=False))"
 ```
 
-Retraining it from the StatsBomb cache — 1.3 GB as it stands here, fetched at one request per second
-if the cache is empty —
+Retraining it from the StatsBomb cache, 1.3 GB as it stands here, fetched at one request per second
+if the cache is empty -
 writes both artefacts, so point `--out` somewhere temporary unless you mean to replace the shipped
 ones:
 
@@ -836,7 +836,7 @@ ones:
 uv run python -m pressing.proxy --out /tmp/proxy_check.pkl.gz
 ```
 
-**The label calibration against true tracking** — needs both the StatsBomb cache and Metrica's CSVs,
+**The label calibration against true tracking**, needs both the StatsBomb cache and Metrica's CSVs,
 and takes hours:
 
 ```sh
@@ -886,7 +886,7 @@ print(t[t["join_status"] == "matched"]["join_tier"].value_counts().to_string())
 PY
 ```
 
-**The upstream Metrica commit behind the bundled demo asset** — the check `data/demo/NOTICE.md`
+**The upstream Metrica commit behind the bundled demo asset**, the check `data/demo/NOTICE.md`
 records, which needs network:
 
 ```sh

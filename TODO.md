@@ -49,7 +49,7 @@ decided against on purpose. Numbers here are reproducible by the commands in the
   The conditional baseline landed; the residual it produces separates players at p = 0.67 on the
   bundled match and every printed interval covers zero. `pressing.baseline` puts the requirement at
   roughly 233 nearby losses per player for the level and 194 for the residual against a median of 24
-  in a match — eight to ten full matches each. The only real fix is more tracked matches, and there
+  in a match, eight to ten full matches each. The only real fix is more tracked matches, and there
   are two on earth I can get.
 - **The conditional baseline is in-sample when there is only one match.** With two or more matches the
   residual is out-of-fold by construction; with one it is fitted on the losses it scores.
@@ -77,7 +77,7 @@ decided against on purpose. Numbers here are reproducible by the commands in the
   nothing has ever been done about its cost: on the bundled match it adds 255 PNGs and takes the demo
   process from 39.4 s to 97.9 s of CPU, a factor of 2.5.
 
-## Fixed in v0.1.1 — recorded so the ledger is honest about what moved
+## Fixed in v0.1.1, recorded so the ledger is honest about what moved
 
 - The player table's field-position problem is now **measured and printed on page 6**, not just
   described in a README: r = +0.98 over 27 players against a position-only model, the per-phase
@@ -87,7 +87,7 @@ decided against on purpose. Numbers here are reproducible by the commands in the
   `Better is` column so that "+0.48 s slower to win the ball back" is no longer styled like a gain.
 - The proxy refit is deterministic across processes; both artefacts carry `train_match_ids` and
   `held_out_match_ids`; `score_held_out` refuses to score the refit model on its own training matches.
-  Every proxy figure moved with the fix (held-out r 0.3907 → 0.3692) and the old three-decimal
+  Every proxy figure moved with the fix (held-out r 0.3907 -> 0.3692) and the old three-decimal
   "reproducible to within 0.001" claim is gone, because it was not.
 - The season scatter's correlation note is legible, and every colourbar in the project carries numeric
   ticks.

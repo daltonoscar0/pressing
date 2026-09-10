@@ -25,8 +25,8 @@ Two tests keep that claim honest:
 
 ### Why synthetic rather than derived
 
-The Metrica sample-data repository publishes no licence file — GitHub reports
-`license: null`, which is all rights reserved by default — and its README asks
+The Metrica sample-data repository publishes no licence file, GitHub reports
+`license: null`, which is all rights reserved by default, and its README asks
 only that users be responsible with the data and acknowledge the source. This
 project's data decision is therefore to ship derived or invented assets and
 never the raw CSVs. A quantised or downsampled slice of the real match would
@@ -39,7 +39,7 @@ one script.
 Compared line by line against all twelve upstream CSVs (576,014 distinct
 non-empty lines) on 2026-08-25:
 
-- **13 whole lines match verbatim, and every one of them is a header row** —
+- **13 whole lines match verbatim, and every one of them is a header row** -
   the two events-file header rows, and the team-name, shirt-number and
   column-name rows of the four tracking files. **Zero data rows match.**
   Those header rows are the container: an events header identical for every
@@ -48,7 +48,7 @@ non-empty lines) on 2026-08-25:
   no coordinates in them.
 - **11 of 13,663 adjacent `(x, y)` coordinate pairs collide**, 0.08%.
   Regenerating the same fixtures from a different PRNG seed gives 9 of 13,663,
-  0.07% — the same rate, so the collisions are chance, not provenance. The
+  0.07%, the same rate, so the collisions are chance, not provenance. The
   upstream files hold 6,396,548 distinct pairs.
 - Per-cell overlap is high (about 89%) and means nothing: upstream holds
   246,842 distinct 5-decimal values in a space of roughly 100,000 slots per

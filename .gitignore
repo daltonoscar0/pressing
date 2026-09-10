@@ -24,3 +24,11 @@ out/
 /*.pdf
 !data/demo/**/*.pdf
 !docs/**/*.pdf
+CLAUDE.md
+AGENTS.md
+.claude/
+.agentnotes/
+.cursor/
+.mcp.json
+tasks/lessons.md
+tasks/todo.md
