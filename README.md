@@ -1,5 +1,7 @@
 # pressing
 
+[![tests](https://github.com/daltonoscar0/pressing/actions/workflows/tests.yml/badge.svg)](https://github.com/daltonoscar0/pressing/actions/workflows/tests.yml)
+
 **What it is.** When a team loses the ball, the next five seconds decide whether they get it straight
 back or spend the next minute defending. `pressing` measures exactly that. Give it a match's tracking
 data and it finds every moment possession changed hands in open play, works out how much of the pitch
